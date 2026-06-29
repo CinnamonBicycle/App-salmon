@@ -1,2 +1,2 @@
 # App-salmon
-A service that spawns apps (thus the salmon who are famous for spawning). Intended for test infrastructure. Initially limited to Supabase and an OpenRouter proxy.
+A service that spawns apps (thus the salmon who are famous for spawning). Intended for test infrastructure. Initially limited to Supabase, an OpenRouter proxy, and plain Postgres (with pgvector extension) with optional observability.
