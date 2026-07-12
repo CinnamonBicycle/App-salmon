@@ -4,3 +4,48 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1.89"
+axum = "0.8.9"
+bollard = "0.21.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.1", features = ["derive"] }
+flate2 = "1.1.9"
+rand = "0.10.2"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "signal", "time", "net", "fs", "sync", "io-util"] }
+tokio-postgres = { version = "0.7.18", features = ["runtime"] }
+tokio-util = "0.7.18"
+toml = "1.1.2"
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.0", features = ["trace"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+ulid = { version = "2.0.1", features = ["serde"] }
+utoipa = { version = "5.5.0", features = ["axum_extras", "chrono"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+
+[dev-dependencies]
+mockall = "0.15.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
