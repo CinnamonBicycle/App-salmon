@@ -33,10 +33,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/app-salmon-e2e-vm"
-IMAGE_NAME="noble-server-cloudimg-amd64.img"
-IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/${IMAGE_NAME}"
-SHA_URL="https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+# shellcheck source=./lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
 KEEP=0
 TIMEOUT=1800
@@ -58,63 +56,11 @@ while [ $# -gt 0 ]; do
 done
 
 echo "== checking host prerequisites =="
-command -v qemu-system-x86_64 >/dev/null 2>&1 || {
-	echo "qemu-system-x86_64 not found." >&2
-	echo "  run: ./scripts/vm/setup-vm-host.sh  (one-time; installs qemu, no other host changes)" >&2
-	exit 1
-}
-command -v qemu-img >/dev/null 2>&1 || {
-	echo "qemu-img not found." >&2
-	echo "  run: ./scripts/vm/setup-vm-host.sh  (one-time; installs qemu, no other host changes)" >&2
-	exit 1
-}
-[ -r /dev/kvm ] && [ -w /dev/kvm ] || {
-	echo "/dev/kvm not accessible by this user." >&2
-	echo "  run: ./scripts/vm/setup-vm-host.sh  (one-time; adds you to the kvm group, nothing" >&2
-	echo "  else — you'll need to log out and back in afterwards for it to take effect)." >&2
-	exit 1
-}
-
-SEED_TOOL=""
-for candidate in cloud-localds genisoimage mkisofs xorriso; do
-	if command -v "$candidate" >/dev/null 2>&1; then
-		SEED_TOOL="$candidate"
-		break
-	fi
-done
-[ -n "$SEED_TOOL" ] || {
-	echo "none of cloud-localds/genisoimage/mkisofs/xorriso found." >&2
-	echo "  run: ./scripts/vm/setup-vm-host.sh  (one-time; installs cloud-image-utils)" >&2
-	exit 1
-}
+vm_check_host_prereqs
 echo "  ok (seed tool: $SEED_TOOL)"
 
-mkdir -p "$CACHE_DIR"
-
 echo "== base image =="
-if [ ! -f "$CACHE_DIR/$IMAGE_NAME" ]; then
-	echo "  downloading $IMAGE_URL"
-	curl -fL --progress-bar -o "$CACHE_DIR/$IMAGE_NAME.part" "$IMAGE_URL"
-	mv "$CACHE_DIR/$IMAGE_NAME.part" "$CACHE_DIR/$IMAGE_NAME"
-fi
-echo "  verifying checksum against $SHA_URL"
-expected="$(curl -fsL "$SHA_URL" | grep " \*${IMAGE_NAME}\$" | cut -d' ' -f1)"
-[ -n "$expected" ] || {
-	echo "could not find $IMAGE_NAME in SHA256SUMS" >&2
-	exit 1
-}
-actual="$(sha256sum "$CACHE_DIR/$IMAGE_NAME" | cut -d' ' -f1)"
-if [ "$expected" != "$actual" ]; then
-	echo "  cached image checksum mismatch (expected $expected, got $actual); redownloading" >&2
-	rm -f "$CACHE_DIR/$IMAGE_NAME"
-	curl -fL --progress-bar -o "$CACHE_DIR/$IMAGE_NAME" "$IMAGE_URL"
-	actual="$(sha256sum "$CACHE_DIR/$IMAGE_NAME" | cut -d' ' -f1)"
-	[ "$expected" = "$actual" ] || {
-		echo "checksum still mismatched after redownload; aborting" >&2
-		exit 1
-	}
-fi
-echo "  ok ($actual)"
+vm_ensure_base_image
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/app-salmon-e2e-vm.XXXXXX")"
 cleanup() {
@@ -127,7 +73,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== overlay disk (base image itself is never modified) =="
-qemu-img create -f qcow2 -F qcow2 -b "$CACHE_DIR/$IMAGE_NAME" "$WORKDIR/overlay.qcow2" 20G >/dev/null
+qemu-img create -f qcow2 -F qcow2 -b "$VM_BASE_IMAGE" "$WORKDIR/overlay.qcow2" 20G >/dev/null
 
 echo "== cloud-init seed =="
 GUEST_INIT_B64="$(base64 -w0 "$SCRIPT_DIR/guest-init.sh")"
@@ -147,18 +93,7 @@ instance-id: app-salmon-e2e-$(date +%s)
 local-hostname: app-salmon-e2e
 EOF
 
-case "$SEED_TOOL" in
-cloud-localds)
-	cloud-localds "$WORKDIR/seed.iso" "$WORKDIR/user-data" "$WORKDIR/meta-data"
-	;;
-*)
-	# genisoimage, mkisofs, and `xorriso -as genisoimage` all accept this same argument shape.
-	iso_cmd=("$SEED_TOOL")
-	[ "$SEED_TOOL" = "xorriso" ] && iso_cmd+=(-as genisoimage)
-	"${iso_cmd[@]}" -output "$WORKDIR/seed.iso" -volid cidata -joliet -rock \
-		"$WORKDIR/user-data" "$WORKDIR/meta-data" >/dev/null
-	;;
-esac
+vm_build_seed_iso "$WORKDIR/seed.iso" "$WORKDIR/user-data" "$WORKDIR/meta-data"
 
 RESULT_DIR="$REPO_ROOT/.e2e-vm-result"
 rm -rf "$RESULT_DIR"

@@ -497,20 +497,127 @@ access should run `just setup-e2e-vm && just test-e2e-vm` against a scratch chec
 whatever it finds as a bug report against this section — same posture already established for the
 e2e suite itself in §8a.
 
+## 8c. Persistent VM for iterative testing — `just e2e-vm-up` / `e2e-vm-test` / `e2e-vm-down`
+
+`test-e2e-vm` (§8b) boots, provisions, and discards a VM on every single call — correct for a
+one-shot run, expensive if you're iterating on e2e-suite-relevant code and want to run it
+repeatedly in one sitting. `just e2e-vm-up` boots a VM once and leaves it running; `just
+e2e-vm-test` (which `just ci` also uses automatically when such a VM is up — see below) runs the
+suite against it over SSH in a few seconds instead of minutes; `just e2e-vm-down` tears it down
+and wipes its disk. Same host prerequisites as §8b (`just setup-e2e-vm`), same "only sudo used
+is the one-time KVM group grant" property.
+
+**How `just ci` finds it:** `ci`'s e2e step runs `scripts/vm/e2e-vm-status.sh` first (silently);
+if that reports the persistent VM up, `ci` runs the suite against it (`just e2e-vm-test`) instead
+of the bare-host path. `ci` never boots a VM itself — that's a multi-minute cost, too heavy for a
+gate you might run many times while iterating — it only *uses* one if you already started it. If
+neither the persistent VM nor the bare-host setup is available, `ci` prints all three options
+(persistent VM, one-shot VM, bare host) so the omission is never silent.
+
+**Design:**
+- `scripts/vm/lib.sh`: helpers shared with `run-e2e-in-vm.sh` (host-prereq checks, base-image
+  download+verify, seed-ISO building) plus persistent-VM-specific ones: `vm_find_free_port`
+  (asks the OS for a free `127.0.0.1` port via a throwaway Python socket bind — a small, accepted
+  TOCTOU race for a local single-user dev tool), `vm_pid_is_our_qemu` (checks `/proc/<pid>/cmdline`
+  contains both `qemu-system-x86_64` and a marker — the overlay disk's path — so a stale pidfile
+  whose PID has been reused by an unrelated process can't be mistaken for our VM), and `vm_ssh`
+  (see security model below).
+- `scripts/vm/e2e-vm-up.sh`: idempotent (does nothing if a healthy instance is already up),
+  reaps a stale state dir (dead or mismatched-identity pidfile) if one's left over from a crash,
+  generates a fresh ed25519 host keypair and client keypair, picks a free port, boots with
+  `-netdev user,id=net0,hostfwd=tcp:127.0.0.1:<port>-:22` (see security model — the `127.0.0.1`
+  is load-bearing, not decorative) plus `-name guest=app-salmon-e2e-persistent -pidfile
+  <state>/qemu.pid -daemonize` so it backgrounds itself and leaves a real PID for later checks,
+  waits for SSH, then runs `guest-provision.sh` over SSH and marks the instance `provisioned`.
+- `scripts/vm/guest-provision.sh`: the apt/rustup/`setup-e2e-env.sh` portion of the old
+  `guest-init.sh`, factored out and made the *only* copy of that logic — both `e2e-vm-up.sh` (once,
+  after first boot) and `e2e-vm-run-tests.sh` (every call) run it, and because every step in it
+  checks current state before acting, a fully-provisioned guest re-running it pays only a few
+  seconds of checks. **This is what makes a future phase's new e2e prerequisites "just work"**
+  the next time someone runs the suite against an already-up VM, with no version tracking needed
+  anywhere — v0.2.0 adding a new apt package or a new `setup-e2e-env.sh` step is picked up
+  automatically by the next `just e2e-vm-test` or `just ci`.
+- `scripts/vm/e2e-vm-run-tests.sh` / `e2e-vm-status.sh` / `e2e-vm-down.sh`: thin wrappers around
+  `lib.sh`'s `vm_persistent_is_up`/`vm_persistent_is_provisioned`/`vm_reap_stale`. `down` tries a
+  graceful `sudo poweroff` over SSH first, falls back to `SIGTERM`/`SIGKILL` on the qemu process,
+  then always wipes the whole state directory (overlay disk, keys, logs) — the persistence
+  boundary this session settled on is "within a session," not across `down`/`up` cycles, matching
+  the rest of this tooling's ephemeral-by-default philosophy.
+- **State directory:** `<repo>/.e2e-vm-state/` (gitignored, `0700`) — scoping it under the
+  checkout itself, rather than e.g. a hash under `/tmp`, is what makes "one persistent VM per
+  checkout" true with no extra bookkeeping: two clones naturally get two state dirs and two VMs.
+  Contains the overlay disk, seed ISO, both SSH keypairs, a pinned `known_hosts`, the console
+  log, qemu's pidfile, and a `provisioned` marker.
+
+**Security model for the SSH transport (this is new attack surface `test-e2e-vm` doesn't have,
+since that path never listens for inbound connections):**
+- **The forwarded port is bound to `127.0.0.1` only** (`hostfwd=tcp:127.0.0.1:<port>-:22`, not
+  the bare `hostfwd=tcp::<port>-:22` form, which binds `0.0.0.0` and would expose the guest's
+  sshd to the whole network — an easy mistake, since most hostfwd examples online use the bare
+  form). This stops network-remote attackers.
+- **Loopback binding alone is not enough**, because TCP loopback isn't scoped to the owning user
+  the way a Unix socket's file permissions are — any other local account on a shared host can
+  still `connect()` to a `127.0.0.1`-bound port. What actually stops them from getting a shell in
+  the guest is **pubkey-only authentication**: `ssh_pwauth: false` in the guest's cloud-config,
+  plus a client keypair generated fresh per instance (`0600`, deleted with the rest of the state
+  dir on `down`). This is load-bearing, not defense-in-depth on top of the loopback bind.
+- **The guest's SSH host key is generated on the host, not trust-on-first-use.** `e2e-vm-up.sh`
+  runs `ssh-keygen` itself and injects the resulting keypair into the guest via cloud-init
+  `write_files` (`ssh_genkeytypes: []` stops cloud-init from generating/overwriting it), so the
+  host already knows the exact key before ever connecting and pins it in a per-instance
+  `known_hosts` (`vm_ssh` always passes `StrictHostKeyChecking=yes` against that file, never
+  `/dev/null`/`accept-new`). This closes the TOFU gap a freshly-booted VM would otherwise have,
+  and doubles as what makes `vm_persistent_is_up`'s SSH probe a *reliable* health check — a
+  probe against `StrictHostKeyChecking=no` could be fooled by some other process holding the
+  port; a pinned-host-key probe can't.
+- **9p share exposure is unchanged from §8b** and longer-lived now: the guest (root,
+  `security_model=none`) can write anywhere under the host's checkout for as long as the VM is
+  up. Same trust model as before (trusted test code, not the future untrusted-edge-function
+  workload) — `CARGO_TARGET_DIR=/tmp/target` keeps build output off the share either way.
+
+**Verification status:** unlike most of §8b, the SSH security model here **was verified for
+real** in this sandbox, without needing KVM — a real local `sshd` stood in for the guest's sshd
+(same host key, same `AuthorizedKeysFile` pointed at the generated client key, same
+`PasswordAuthentication no`), and `vm_ssh`'s exact option set was run against it:
+- A connection with the correct pinned host key and correct client key succeeds.
+- A connection with the *wrong* pinned host key in `known_hosts` is rejected outright by SSH's
+  own host-key-changed warning (`Host key verification failed`) — confirming the pinning is
+  load-bearing, not merely present.
+- A connection with the wrong client key is rejected with `Permission denied (publickey)` and no
+  password fallback — confirming pubkey-only auth is actually enforced, not just configured.
+- `vm_pid_is_our_qemu` was exercised against a real (tcg-accelerated) `qemu-system-x86_64`
+  process booted with the exact `-name`/`-pidfile`/`-daemonize` flags this script uses, including
+  its two negative cases (wrong marker, dead PID) — all three branches behave as designed.
+- The persistent VM's cloud-init `user-data` (host key + pubkey `write_files`, `ssh_authorized_keys`)
+  was parsed with a real YAML parser and the base64-embedded host keypair round-trips byte-for-byte.
+- `qemu-img create -F qcow2` and the `-daemonize`/`-pidfile` combination were both exercised for
+  real (the latter confirmed to write the correct PID before the launching shell command returns).
+
+What is still **not** verified, for the same KVM/root reasons as §8b: whether the guest actually
+boots and reaches cloud-init's `write_files`/`runcmd` stage for real, whether `guest-provision.sh`
+succeeds inside the real cloud image, and end-to-end `e2e-vm-up.sh` → `e2e-vm-test` → `e2e-vm-down.sh`
+against a real KVM host. Same next step as §8b: the first session with real `/dev/kvm` access
+should run the full cycle against a scratch checkout.
+
 ## 9. Testing & coverage
 
 - `just ci` — the single command: format check, clippy (deny-on-warnings, `--all-targets
-  --all-features`), unit tests, and the e2e suite *if* this machine has Docker + the e2e client
-  accounts provisioned (checked via `docker info` + `id e2e-agent`; if not, `just ci` prints a
-  clear message and does not silently skip — running it *without* those prerequisites is expected
-  to leave e2e unrun, not to fail).
+  --all-features`), unit tests, and the e2e suite against whichever of the following is
+  available, in order: a persistent e2e VM already up (§8c), the bare-host setup (checked via
+  `docker info` + `id e2e-agent`), or — if neither — a clear message listing all three ways to
+  get one running, never a silent skip.
 - `just test-unit` / `just test-e2e` / `just test-all` — independently runnable, per the
   requirement that unit and e2e stay separable.
-- `just setup-e2e-vm` / `just test-e2e-vm` (recommended over `setup-e2e`/`test-e2e`) — runs the
-  same e2e suite inside a disposable QEMU VM instead of on this machine, so
+- `just setup-e2e-vm` / `just test-e2e-vm` (recommended over `setup-e2e`/`test-e2e` for a single
+  run) — runs the e2e suite inside a disposable QEMU VM instead of on this machine, so
   `setup-e2e-env.sh`'s host-level changes never touch the machine actually running the tooling;
   this machine only needs QEMU + `/dev/kvm` access, which `setup-e2e-vm` gets for you (sudo used
   once, for two generic non-App-Salmon-specific things). See §8b for the design and its
+  verification status.
+- `just e2e-vm-up` / `e2e-vm-test` / `e2e-vm-down` (recommended over `test-e2e-vm` if you're
+  running the suite more than once in a sitting) — same disposable-VM idea, but the VM stays up
+  across multiple test runs instead of being discarded every call, and `just ci` detects and uses
+  it automatically. See §8c for the design, the SSH transport's security model, and its
   verification status.
 - `just coverage` (needs `cargo install cargo-llvm-cov` + `rustup component add
   llvm-tools-preview` once per machine) — measures the **entire** `--lib` target, no

@@ -2,17 +2,24 @@
 # should run; the pieces are also independently runnable.
 
 # Run everything CI checks: formatting, lint, unit coverage, and e2e if this machine is set up
-# for it (never silently skipped — see `test-e2e`).
+# for it (never silently skipped — see `test-e2e`). Prefers, in order: a persistent e2e VM
+# already up (fast — no boot/provision cost per run), then the bare-host setup, then a reminder
+# covering every option if neither is available. Deliberately does NOT boot an ephemeral VM
+# itself (`test-e2e-vm`) — that's a multi-minute image-download-and-boot cost, too heavy for a
+# gate you might run many times while iterating; that path stays opt-in.
 ci: fmt-check lint test-unit
     #!/usr/bin/env bash
     set -euo pipefail
-    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && id e2e-agent >/dev/null 2>&1; then
+    if ./scripts/vm/e2e-vm-status.sh >/dev/null 2>&1; then
+        just e2e-vm-test
+    elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && id e2e-agent >/dev/null 2>&1; then
         just test-e2e
     else
-        echo "e2e prerequisites not detected (docker reachable + e2e-agent account provisioned)."
-        echo "Two ways to run it:"
-        echo "  just setup-e2e-vm && just test-e2e-vm   (no root needed beyond a one-time KVM group grant)"
-        echo "  sudo ./scripts/setup-e2e-env.sh && just test-e2e   (root, persists e2e system accounts)"
+        echo "e2e prerequisites not detected (no persistent e2e VM up, and no bare-host docker +"
+        echo "e2e-agent account). Options, in order of preference:"
+        echo "  just e2e-vm-up && just ci                         (persistent VM, reused across runs)"
+        echo "  just setup-e2e-vm && just test-e2e-vm             (one-shot disposable VM)"
+        echo "  sudo ./scripts/setup-e2e-env.sh && just test-e2e  (root, persists e2e system accounts)"
     fi
 
 # Format the whole workspace.
@@ -74,7 +81,28 @@ setup-e2e-vm:
 # Run the e2e suite inside an ephemeral, disposable QEMU VM instead of on this machine directly
 # — so setup-e2e's useradd/sudoers.d writes and the e2e suite's Docker usage land on a throwaway
 # guest, not here. Needs `just setup-e2e-vm` to have been run once; does NOT need root, Docker,
-# or scripts/setup-e2e-env.sh to have been run on this machine — this is the recommended way to
-# run the e2e suite unless you have a specific reason to run it against this host directly.
+# or scripts/setup-e2e-env.sh to have been run on this machine. Boots, provisions, tests, and
+# discards the VM every single call — prefer `just e2e-vm-up` + `just e2e-vm-test` if you're
+# going to run the suite more than once in a session, which skips the repeated boot/provision
+# cost this pays every time.
 test-e2e-vm *args:
     ./scripts/vm/run-e2e-in-vm.sh {{ args }}
+
+# Boot a persistent e2e VM that stays up across multiple test runs — unlike test-e2e-vm, which
+# boots, tests, and discards on every call. Idempotent (safe to run if already up). Needs
+# `just setup-e2e-vm` to have been run once. Run this once per session, then `just e2e-vm-test`
+# (or just `just ci`) as many times as you like, then `just e2e-vm-down` when done.
+e2e-vm-up:
+    ./scripts/vm/e2e-vm-up.sh
+
+# Run the e2e suite against the persistent VM from `just e2e-vm-up` (must already be up).
+e2e-vm-test:
+    ./scripts/vm/e2e-vm-run-tests.sh
+
+# Whether the persistent e2e VM is up (and provisioned/ready for e2e-vm-test).
+e2e-vm-status:
+    ./scripts/vm/e2e-vm-status.sh
+
+# Tear down the persistent e2e VM and wipe its disk. Run this when you're done for the session.
+e2e-vm-down:
+    ./scripts/vm/e2e-vm-down.sh
