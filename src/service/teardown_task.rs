@@ -11,10 +11,10 @@
 //! the daemon being briefly unreachable) doesn't leave the row stuck in `Deleting` forever and
 //! permanently consuming a quota slot and a worker.
 
+use crate::client_workers::worker_data_dir;
 use crate::domain::cluster::Cluster;
 use crate::ports::privileged_exec::PrivilegedCommand;
 use crate::service::deps::TaskDeps;
-use crate::worker_pool::worker_data_dir;
 
 /// Tears down whatever `cluster`'s backend and worker directory hold, then deletes its row.
 /// Idempotent and best-effort at each step: a failure at any point is logged and cleanup
@@ -26,10 +26,9 @@ use crate::worker_pool::worker_data_dir;
 /// # Arguments
 ///
 /// - `deps`: shared task dependencies — the registered backend for `cluster`'s service kind (if
-///   any), the privileged executor used to wipe the worker directory, the worker pool, and the
-///   repository.
+///   any), the privileged executor used to wipe the worker directory, and the repository.
 /// - `cluster`: the cluster to tear down. If `cluster.worker` is `None` (a spawn that never got
-///   as far as acquiring one), the worker-directory-wipe and worker-release steps are skipped.
+///   as far as resolving one), the worker-directory-wipe step is skipped.
 pub async fn teardown(deps: &TaskDeps, cluster: &Cluster) {
     if let Some(backend) = deps.backends.get(&cluster.service.kind)
         && let Err(error) = backend.teardown(&cluster.id).await
@@ -38,7 +37,7 @@ pub async fn teardown(deps: &TaskDeps, cluster: &Cluster) {
     }
 
     if let Some(worker) = &cluster.worker {
-        let path = worker_data_dir(&deps.worker_data_dir_base, worker);
+        let path = worker_data_dir(&deps.worker_data_dir_base, worker, cluster.slot);
         let wipe = deps
             .privileged_exec
             .run_as(
@@ -50,10 +49,6 @@ pub async fn teardown(deps: &TaskDeps, cluster: &Cluster) {
             .await;
         if let Err(error) = wipe {
             tracing::warn!(cluster_id = %cluster.id, worker = %worker, error = %error, "wipe worker dir failed; continuing cleanup");
-        }
-
-        if let Err(error) = deps.worker_pool.release(worker.clone()).await {
-            tracing::warn!(cluster_id = %cluster.id, worker = %worker, error = %error, "worker release failed");
         }
     }
 
@@ -79,6 +74,7 @@ pub async fn run(deps: std::sync::Arc<TaskDeps>, cluster: Cluster) {
 mod tests {
     use super::teardown;
     use crate::backends::ClusterBackend;
+    use crate::client_workers::ClientWorkers;
     use crate::domain::cluster::{Cluster, ClusterState, DeleteReason};
     use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
     use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
@@ -89,7 +85,6 @@ mod tests {
     use crate::ports::repository::ClusterRepository;
     use crate::service::deps::TaskDeps;
     use crate::test_support::InMemoryClusterRepository;
-    use crate::worker_pool::WorkerPool;
     use async_trait::async_trait;
     use chrono::{TimeDelta, Utc};
     use std::collections::HashMap;
@@ -112,6 +107,7 @@ mod tests {
             &self,
             _cluster_id: &ClusterId,
             _worker: &WorkerUser,
+            _slot: u32,
             _service: &ServiceSpec,
         ) -> Result<ConnectionInfo, crate::domain::cluster::ClusterError> {
             unreachable!("teardown tests never call spawn")
@@ -182,11 +178,12 @@ mod tests {
                 reason: DeleteReason::UserRequested,
             },
             worker,
+            slot: 0,
         }
     }
 
     #[tokio::test]
-    async fn teardown_calls_backend_wipes_worker_releases_and_deletes_row() {
+    async fn teardown_calls_backend_wipes_worker_directory_and_deletes_row() {
         let backend = Arc::new(RecordingBackend {
             kind: ServiceKind::Postgres,
             teardown_calls: AtomicUsize::new(0),
@@ -197,11 +194,6 @@ mod tests {
             fail_wipe: AtomicBool::new(false),
         });
         let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let pool = Arc::new(WorkerPool::new(vec![worker.clone()]));
-        // Simulate the worker having been acquired already, as spawn_task would have done
-        // before this cluster reached `Deleting` — so `teardown` releasing it below is a real
-        // acquired -> released transition, not a double-release.
-        pool.acquire().await.expect("simulate prior acquisition");
         let repository = Arc::new(InMemoryClusterRepository::new());
 
         let cluster = deleting_cluster(Some(worker.clone()));
@@ -212,7 +204,7 @@ mod tests {
 
         let deps = TaskDeps {
             repository: repository.clone(),
-            worker_pool: pool.clone(),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: executor.clone(),
             backends: HashMap::from([(
                 ServiceKind::Postgres,
@@ -226,7 +218,6 @@ mod tests {
 
         assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 1);
         assert_eq!(executor.wipe_calls.lock().expect("lock").len(), 1);
-        assert_eq!(pool.free_count().await, 1);
         assert!(
             repository
                 .get_any(&cluster.id)
@@ -256,7 +247,7 @@ mod tests {
 
         let deps = TaskDeps {
             repository: repository.clone(),
-            worker_pool: Arc::new(WorkerPool::new(vec![])),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: executor.clone(),
             backends: HashMap::from([(
                 ServiceKind::Postgres,
@@ -298,7 +289,7 @@ mod tests {
 
         let deps = TaskDeps {
             repository: repository.clone(),
-            worker_pool: Arc::new(WorkerPool::new(vec![])),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: executor,
             backends: HashMap::from([(ServiceKind::Postgres, backend as Arc<dyn ClusterBackend>)]),
             clock: Arc::new(FakeClock::new(Utc::now())),
@@ -329,7 +320,7 @@ mod tests {
 
         let deps = TaskDeps {
             repository: repository.clone(),
-            worker_pool: Arc::new(WorkerPool::new(vec![])),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: Arc::new(RecordingExecutor {
                 wipe_calls: Mutex::new(Vec::new()),
                 fail_wipe: AtomicBool::new(false),
@@ -351,7 +342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wipe_failure_is_logged_but_teardown_still_releases_worker_and_deletes_row() {
+    async fn wipe_failure_is_logged_but_teardown_still_deletes_the_row() {
         let backend = Arc::new(RecordingBackend {
             kind: ServiceKind::Postgres,
             teardown_calls: AtomicUsize::new(0),
@@ -362,8 +353,6 @@ mod tests {
             fail_wipe: AtomicBool::new(true),
         });
         let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let pool = Arc::new(WorkerPool::new(vec![worker.clone()]));
-        pool.acquire().await.expect("simulate prior acquisition");
         let repository = Arc::new(InMemoryClusterRepository::new());
 
         let cluster = deleting_cluster(Some(worker.clone()));
@@ -374,7 +363,7 @@ mod tests {
 
         let deps = TaskDeps {
             repository: repository.clone(),
-            worker_pool: pool.clone(),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: executor.clone(),
             backends: HashMap::from([(
                 ServiceKind::Postgres,
@@ -387,11 +376,6 @@ mod tests {
         teardown(&deps, &cluster).await;
 
         assert_eq!(executor.wipe_calls.lock().expect("lock").len(), 1);
-        assert_eq!(
-            pool.free_count().await,
-            1,
-            "worker is still released even though wiping its directory failed"
-        );
         assert!(
             repository
                 .get_any(&cluster.id)
@@ -423,7 +407,7 @@ mod tests {
 
         let deps = TaskDeps {
             repository: Arc::new(repository),
-            worker_pool: Arc::new(WorkerPool::new(vec![])),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: Arc::new(RecordingExecutor {
                 wipe_calls: Mutex::new(Vec::new()),
                 fail_wipe: AtomicBool::new(false),

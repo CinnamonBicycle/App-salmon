@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::backends::ClusterBackend;
+use crate::client_workers::ClientWorkers;
 use crate::domain::ids::ClusterId;
 use crate::domain::service_kind::ServiceKind;
 use crate::ports::clock::Clock;
 use crate::ports::privileged_exec::PrivilegedExecutor;
 use crate::ports::repository::ClusterRepository;
-use crate::worker_pool::WorkerPool;
 
 /// Bundle of dependencies shared by every background task (`spawn_task`, `teardown_task`,
 /// `ttl_reaper`, `reconciliation`). See the module docs above for why this is one shared struct
@@ -22,8 +22,8 @@ use crate::worker_pool::WorkerPool;
 pub struct TaskDeps {
     /// Durable store of cluster rows.
     pub repository: Arc<dyn ClusterRepository>,
-    /// Free-list of Unix worker accounts clusters are allocated from.
-    pub worker_pool: Arc<WorkerPool>,
+    /// Static mapping from each configured client to its own Unix account.
+    pub client_workers: Arc<ClientWorkers>,
     /// Runs the closed set of privileged filesystem operations (prepare/wipe a worker's
     /// directory) as that worker's account.
     pub privileged_exec: Arc<dyn PrivilegedExecutor>,

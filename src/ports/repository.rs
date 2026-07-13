@@ -57,7 +57,13 @@ pub enum RepositoryError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {
     /// The row was inserted; the owner was under quota.
-    Inserted,
+    Inserted {
+        /// The directory slot (`0..limit`) the repository assigned this row — the smallest slot
+        /// not already used by one of the owner's other active rows, computed from the same
+        /// locked read as the quota count so two concurrent inserts for the same owner can never
+        /// be assigned the same slot. See [`crate::domain::cluster::Cluster::slot`].
+        slot: u32,
+    },
     /// The row was **not** inserted; the owner was already at or over `limit`.
     QuotaExceeded {
         /// How many active clusters the owner had at the time of the check.
@@ -68,18 +74,24 @@ pub enum InsertOutcome {
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait ClusterRepository: Send + Sync {
-    /// Atomically checks `owner`'s current cluster count against `limit` and inserts `cluster`
-    /// only if under it, in one transaction. This is the fix for the check-then-insert race: two
-    /// concurrent creates from the same owner must not both observe "under quota".
+    /// Atomically checks `owner`'s current cluster count against `limit`, and if under it, also
+    /// assigns the row a free directory slot (see [`InsertOutcome::Inserted`]) and inserts it — all
+    /// in one transaction. This is the fix for the check-then-insert race (two concurrent creates
+    /// from the same owner must not both observe "under quota"), and — since it happens in the
+    /// same transaction — also the fix for the equivalent race in slot assignment (two concurrent
+    /// creates from the same owner must not be assigned the same slot). `cluster.slot`'s incoming
+    /// value is ignored; the assigned slot in the returned [`InsertOutcome::Inserted`] is
+    /// authoritative.
     ///
     /// # Arguments
     ///
     /// - `cluster`: the new cluster row to insert if the owner is under quota.
-    /// - `limit`: the maximum number of active clusters `cluster.owner` may hold.
+    /// - `limit`: the maximum number of active clusters `cluster.owner` may hold; also the number
+    ///   of directory slots (`0..limit`) available to assign from.
     ///
     /// # Returns
     ///
-    /// [`InsertOutcome::Inserted`] if the row was inserted, or
+    /// [`InsertOutcome::Inserted`] (carrying the assigned slot) if the row was inserted, or
     /// [`InsertOutcome::QuotaExceeded`] (with the owner's current count) if it wasn't.
     ///
     /// # Errors

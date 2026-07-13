@@ -68,17 +68,6 @@ pub struct LimitsConfig {
     pub failed_cluster_reap_delay_secs: u64,
 }
 
-/// `[worker_pool]` — the pre-provisioned Unix worker accounts clusters are allocated from.
-#[derive(Debug, Clone, Deserialize)]
-pub struct WorkerPoolConfig {
-    /// The common name prefix shared by every worker account (e.g. `salmon-worker-` for
-    /// `salmon-worker-00`, `salmon-worker-01`, ...).
-    pub user_prefix: String,
-    /// How many worker accounts exist (and so the maximum number of clusters that can be
-    /// `Spawning`/`Ready`/`Deleting` at once).
-    pub size: usize,
-}
-
 /// `[docker]` — how to reach the Docker daemon and what image to run.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DockerConfig {
@@ -120,6 +109,10 @@ pub struct ClientConfig {
     /// The SHA-256 hash of the client's bearer secret, in `sha256:<64 hex chars>` form (see
     /// [`crate::auth::hashing::SecretHash::from_hex_with_prefix`]).
     pub secret_hash: String,
+    /// The pre-provisioned Unix account this client's clusters run as (see
+    /// `client_workers::ClientWorkers`) — must exist in `/etc/passwd`, and must not be shared
+    /// with any other `[[clients]]` entry (see [`Config::validate`]).
+    pub unix_user: String,
 }
 
 /// The full parsed contents of `config.toml`.
@@ -129,8 +122,6 @@ pub struct Config {
     pub server: ServerConfig,
     /// `[limits]` settings.
     pub limits: LimitsConfig,
-    /// `[worker_pool]` settings.
-    pub worker_pool: WorkerPoolConfig,
     /// `[docker]` settings.
     pub docker: DockerConfig,
     /// `[storage]` settings.
@@ -174,7 +165,8 @@ impl Config {
     }
 
     /// Checks semantic constraints `serde`'s structural deserialization can't express on its own
-    /// (TTL ordering, non-zero quotas/pool size, at least one client, well-formed secret hashes).
+    /// (TTL ordering, non-zero quotas, at least one client, well-formed secret hashes, no two
+    /// clients sharing a `unix_user`).
     ///
     /// # Returns
     ///
@@ -199,11 +191,6 @@ impl Config {
                 "limits.max_clusters_per_user must be at least 1".to_string(),
             ));
         }
-        if self.worker_pool.size == 0 {
-            return Err(ConfigError::Invalid(
-                "worker_pool.size must be at least 1".to_string(),
-            ));
-        }
         if self.clients.is_empty() {
             return Err(ConfigError::Invalid(
                 "at least one [[clients]] entry is required".to_string(),
@@ -214,6 +201,16 @@ impl Config {
                 return Err(ConfigError::Invalid(format!(
                     "client '{}' has a malformed secret_hash (expected sha256:<64 hex chars>)",
                     client.name
+                )));
+            }
+        }
+        let mut seen_unix_users = std::collections::HashSet::with_capacity(self.clients.len());
+        for client in &self.clients {
+            if !seen_unix_users.insert(client.unix_user.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "unix_user '{}' is used by more than one [[clients]] entry — each client \
+                     must have its own account",
+                    client.unix_user
                 )));
             }
         }
@@ -265,10 +262,6 @@ health_check_timeout_secs = 60
 ttl_reaper_interval_secs = 5
 failed_cluster_reap_delay_secs = 5
 
-[worker_pool]
-user_prefix = "salmon-worker-"
-size = 4
-
 [docker]
 socket_path = "/var/run/docker.sock"
 postgres_image = "pgvector/pgvector:pg16"
@@ -285,6 +278,7 @@ compress_after_days = 1
 [[clients]]
 name = "openbrain-agent"
 secret_hash = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+unix_user = "openbrain-agent"
 "#
     }
 
@@ -302,7 +296,7 @@ secret_hash = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0
     fn valid_config_parses_and_validates() {
         let config = parse(valid_toml()).expect("valid config");
         assert_eq!(config.clients.len(), 1);
-        assert_eq!(config.worker_pool.size, 4);
+        assert_eq!(config.clients[0].unix_user, "openbrain-agent");
     }
 
     #[test]
@@ -328,8 +322,17 @@ secret_hash = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0
     }
 
     #[test]
-    fn rejects_zero_worker_pool_size() {
-        let toml_str = valid_toml().replace("size = 4", "size = 0");
+    fn rejects_two_clients_sharing_a_unix_user() {
+        let toml_str = format!(
+            "{}\n{}",
+            valid_toml(),
+            r#"
+[[clients]]
+name = "openbrain-agent-2"
+secret_hash = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+unix_user = "openbrain-agent"
+"#
+        );
         let err = parse(&toml_str).expect_err("invalid");
         assert!(matches!(err, super::ConfigError::Invalid(_)));
     }

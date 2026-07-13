@@ -1,5 +1,5 @@
 //! Orchestrates the 4 endpoints' business rules: TTL bounds, the atomic quota check, state
-//! transitions, and repository reads/writes. Deliberately does not touch `WorkerPool`,
+//! transitions, and repository reads/writes. Deliberately does not touch `ClientWorkers`,
 //! `ContainerRuntime`, or `PrivilegedExecutor` — actually provisioning/tearing down a cluster is
 //! `service::spawn_task`/`service::teardown_task`'s job, kicked off by the caller (an HTTP
 //! handler, or the TTL reaper) after this service confirms the state transition is valid. That
@@ -139,6 +139,9 @@ impl ClusterService {
             requested_at: now,
             state: ClusterState::Spawning { started_at: now },
             worker: None,
+            // Placeholder — `try_insert_if_under_quota` ignores this and assigns the real slot
+            // atomically, returned below.
+            slot: 0,
         };
 
         match self
@@ -146,7 +149,7 @@ impl ClusterService {
             .try_insert_if_under_quota(&cluster, self.limits.max_clusters_per_user)
             .await?
         {
-            InsertOutcome::Inserted => Ok(cluster),
+            InsertOutcome::Inserted { slot } => Ok(Cluster { slot, ..cluster }),
             InsertOutcome::QuotaExceeded { current_count } => Err(ClusterError::QuotaExceeded {
                 owner,
                 count: current_count,

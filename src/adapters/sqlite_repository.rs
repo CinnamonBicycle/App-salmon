@@ -274,6 +274,9 @@ struct PersistedCluster {
     state: PersistedState,
     /// The worker account allocated to this cluster, if one has been assigned yet.
     worker: Option<PersistedWorker>,
+    /// The directory slot (`0..max_clusters_per_user`) assigned to this cluster at insert time —
+    /// see [`crate::domain::cluster::Cluster::slot`].
+    slot: u32,
 }
 
 /// Builds the persistable snapshot of a live [`Cluster`], ready to be JSON-serialized into the
@@ -294,6 +297,7 @@ fn to_persisted(cluster: &Cluster) -> PersistedCluster {
         requested_at: cluster.requested_at,
         state: PersistedState::from(&cluster.state),
         worker: cluster.worker.as_ref().map(PersistedWorker::from),
+        slot: cluster.slot,
     }
 }
 
@@ -322,6 +326,7 @@ fn from_row(id: ClusterId, owner: ClientId, json: &str) -> Result<Cluster, Repos
         requested_at: persisted.requested_at,
         state: persisted.state.into(),
         worker: persisted.worker.map(WorkerUser::from),
+        slot: persisted.slot,
     })
 }
 
@@ -486,17 +491,22 @@ impl SqliteClusterRepository {
 #[async_trait]
 impl ClusterRepository for SqliteClusterRepository {
     /// Implements [`ClusterRepository::try_insert_if_under_quota`] as a single `SQLite`
-    /// transaction: count `owner`'s existing rows, and only insert if under `limit`, so two
-    /// concurrent calls for the same owner can't both observe "under quota" and both succeed.
+    /// transaction: reads `owner`'s existing rows, and only if under `limit`, computes the
+    /// smallest directory slot (`0..limit`) not already used by one of them and inserts the new
+    /// row with that slot — so two concurrent calls for the same owner can't both observe "under
+    /// quota", and can't both be assigned the same slot (both reads happen against the same
+    /// locked transaction state).
     ///
     /// # Arguments
     ///
-    /// - `cluster`: the cluster to insert if the owner is under quota.
-    /// - `limit`: the maximum number of rows `cluster.owner` may have.
+    /// - `cluster`: the cluster to insert if the owner is under quota; its own `slot` field is
+    ///   ignored, since the assigned slot is computed here.
+    /// - `limit`: the maximum number of rows `cluster.owner` may have, and so the number of
+    ///   directory slots available to assign from.
     ///
     /// # Returns
     ///
-    /// [`InsertOutcome::Inserted`] if the row was inserted, or
+    /// [`InsertOutcome::Inserted`] (carrying the assigned slot) if the row was inserted, or
     /// [`InsertOutcome::QuotaExceeded`] (carrying the owner's current row count) if it wasn't.
     ///
     /// # Errors
@@ -511,29 +521,51 @@ impl ClusterRepository for SqliteClusterRepository {
     ) -> Result<InsertOutcome, RepositoryError> {
         let id = cluster.id.to_string();
         let owner = cluster.owner.to_string();
-        let json = serde_json::to_string(&to_persisted(cluster)).map_err(RepositoryError::Serde)?;
+        let cluster = cluster.clone();
 
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(RepositoryError::Db)?;
-            let count: u32 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM clusters WHERE owner = ?1",
-                    params![owner],
-                    |row| row.get(0),
-                )
-                .map_err(RepositoryError::Db)?;
+            let existing_json: Vec<String> = {
+                let mut stmt = tx
+                    .prepare("SELECT data_json FROM clusters WHERE owner = ?1")
+                    .map_err(RepositoryError::Db)?;
+                let rows = stmt
+                    .query_map(params![owner], |row| row.get::<_, String>(0))
+                    .map_err(RepositoryError::Db)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(RepositoryError::Db)?
+            };
+            let count = u32::try_from(existing_json.len()).unwrap_or(u32::MAX);
             if count >= limit {
                 return Ok(InsertOutcome::QuotaExceeded {
                     current_count: count,
                 });
             }
+
+            let used_slots: std::collections::HashSet<u32> = existing_json
+                .iter()
+                .filter_map(|json| serde_json::from_str::<PersistedCluster>(json).ok())
+                .map(|persisted| persisted.slot)
+                .collect();
+            let slot = (0..limit)
+                .find(|candidate| !used_slots.contains(candidate))
+                .ok_or_else(|| {
+                    RepositoryError::CorruptRow(
+                        "no free directory slot available despite being under quota".to_string(),
+                    )
+                })?;
+
+            let mut to_store = cluster;
+            to_store.slot = slot;
+            let json =
+                serde_json::to_string(&to_persisted(&to_store)).map_err(RepositoryError::Serde)?;
             tx.execute(
                 "INSERT INTO clusters (id, owner, data_json) VALUES (?1, ?2, ?3)",
                 params![id, owner, json],
             )
             .map_err(RepositoryError::Db)?;
             tx.commit().map_err(RepositoryError::Db)?;
-            Ok(InsertOutcome::Inserted)
+            Ok(InsertOutcome::Inserted { slot })
         })
         .await
     }
@@ -810,6 +842,7 @@ mod tests {
                 started_at: Utc::now(),
             },
             worker: None,
+            slot: 0,
         }
     }
 
@@ -833,7 +866,7 @@ mod tests {
             .try_insert_if_under_quota(&cluster, 2)
             .await
             .expect("insert");
-        assert_eq!(outcome, InsertOutcome::Inserted);
+        assert_eq!(outcome, InsertOutcome::Inserted { slot: 0 });
 
         let fetched = repo
             .get_owned(&cluster.id, &cluster.owner)
@@ -914,8 +947,8 @@ mod tests {
             .await
             .expect("insert 3");
 
-        assert_eq!(first, InsertOutcome::Inserted);
-        assert_eq!(second, InsertOutcome::Inserted);
+        assert_eq!(first, InsertOutcome::Inserted { slot: 0 });
+        assert_eq!(second, InsertOutcome::Inserted { slot: 1 });
         assert_eq!(third, InsertOutcome::QuotaExceeded { current_count: 2 });
 
         let remaining = repo
@@ -929,7 +962,9 @@ mod tests {
     async fn quota_holds_under_concurrent_creates() {
         // Fires 6 concurrent inserts against a limit of 2 for the same owner — this is the
         // TOCTOU race the atomic check-then-insert transaction exists to close. If the
-        // check-then-insert weren't atomic, more than 2 could observe "under quota" and succeed.
+        // check-then-insert weren't atomic, more than 2 could observe "under quota" and succeed —
+        // and if slot assignment weren't computed from that same locked read, the two winners
+        // could also be assigned the same directory slot.
         let repo = std::sync::Arc::new(
             SqliteClusterRepository::open_in_memory()
                 .await
@@ -945,17 +980,56 @@ mod tests {
             }));
         }
 
-        let mut inserted = 0;
+        let mut assigned_slots = Vec::new();
         let mut rejected = 0;
         for handle in handles {
             match handle.await.expect("task completes").expect("no db error") {
-                InsertOutcome::Inserted => inserted += 1,
+                InsertOutcome::Inserted { slot } => assigned_slots.push(slot),
                 InsertOutcome::QuotaExceeded { .. } => rejected += 1,
             }
         }
 
-        assert_eq!(inserted, 2);
+        assigned_slots.sort_unstable();
+        assert_eq!(
+            assigned_slots,
+            vec![0, 1],
+            "the two winners got distinct slots"
+        );
         assert_eq!(rejected, 4);
+    }
+
+    #[tokio::test]
+    async fn a_freed_slot_is_reused_by_the_next_insert() {
+        let repo = SqliteClusterRepository::open_in_memory()
+            .await
+            .expect("open");
+        let owner = "agent-a";
+        let first = repo
+            .try_insert_if_under_quota(&sample_cluster(owner), 2)
+            .await
+            .expect("insert 1");
+        let InsertOutcome::Inserted { slot: first_slot } = first else {
+            panic!("expected Inserted, got {first:?}");
+        };
+        assert_eq!(first_slot, 0);
+
+        let second_cluster = sample_cluster(owner);
+        repo.try_insert_if_under_quota(&second_cluster, 2)
+            .await
+            .expect("insert 2");
+        repo.delete(&second_cluster.id)
+            .await
+            .expect("delete slot 1's row, freeing it");
+
+        let third = repo
+            .try_insert_if_under_quota(&sample_cluster(owner), 2)
+            .await
+            .expect("insert 3");
+        assert_eq!(
+            third,
+            InsertOutcome::Inserted { slot: 1 },
+            "slot 1 (freed by the delete) is reused rather than rejected for being over quota"
+        );
     }
 
     #[tokio::test]

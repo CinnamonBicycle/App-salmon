@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use tokio::time::Instant;
 
 use crate::backends::ClusterBackend;
+use crate::client_workers::worker_data_dir;
 use crate::domain::cluster::ClusterError;
 use crate::domain::ids::{ClusterId, WorkerUser};
 use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
@@ -33,7 +34,6 @@ use crate::ports::container_runtime::{
 };
 use crate::ports::secrets::SecretGenerator;
 use crate::redacted::Redacted;
-use crate::worker_pool::worker_data_dir;
 
 const CONTAINER_PORT: u16 = 5432;
 const DB_USER: &str = "app_salmon";
@@ -224,6 +224,8 @@ impl ClusterBackend for PostgresBackend {
     ///   container deterministically and to label it.
     /// - `worker`: the pre-allocated worker account the container runs as and whose data
     ///   directory it's bind-mounted into.
+    /// - `slot`: `cluster_id`'s assigned directory slot, used together with `worker` to compute
+    ///   the bind-mounted data directory.
     /// - `service`: the requested service configuration — only `service.pgvector` is consulted
     ///   here (`service.kind` is assumed to already be [`ServiceKind::Postgres`]).
     ///
@@ -240,10 +242,11 @@ impl ClusterBackend for PostgresBackend {
         &self,
         cluster_id: &ClusterId,
         worker: &WorkerUser,
+        slot: u32,
         service: &ServiceSpec,
     ) -> Result<ConnectionInfo, ClusterError> {
         let password = self.secrets.db_password(PASSWORD_LEN);
-        let host_path = worker_data_dir(&self.worker_data_dir_base, worker);
+        let host_path = worker_data_dir(&self.worker_data_dir_base, worker, slot);
         let mut labels = HashMap::with_capacity(1);
         labels.insert(CLUSTER_ID_LABEL.to_string(), cluster_id.to_string());
 
@@ -452,7 +455,7 @@ mod tests {
             pgvector: false,
         };
         let err = backend
-            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, &service)
+            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, 0, &service)
             .await
             .expect_err("create failure propagates");
         assert!(matches!(
@@ -477,7 +480,7 @@ mod tests {
             pgvector: false,
         };
         let err = backend
-            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, &service)
+            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, 0, &service)
             .await
             .expect_err("never publishes a port, so it can never connect");
         assert!(matches!(
@@ -507,7 +510,7 @@ mod tests {
             pgvector: false,
         };
         let err = backend
-            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, &service)
+            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, 0, &service)
             .await
             .expect_err("healthcheck never reports healthy, so it can never become ready");
         assert!(matches!(
@@ -534,7 +537,7 @@ mod tests {
             pgvector: false,
         };
         let connection = backend
-            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, &service)
+            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, 0, &service)
             .await
             .expect("healthy container is a successful spawn");
         assert_eq!(connection.port, 55432);
@@ -565,7 +568,7 @@ mod tests {
             pgvector: false,
         };
         backend
-            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, &service)
+            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, 0, &service)
             .await
             .expect("healthy container is a successful spawn");
 
@@ -592,7 +595,7 @@ mod tests {
             pgvector: false,
         };
         let err = backend
-            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, &service)
+            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, 0, &service)
             .await
             .expect_err("exited container is not healthy");
         assert!(matches!(
@@ -617,7 +620,7 @@ mod tests {
             pgvector: false,
         };
         let err = backend
-            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, &service)
+            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, 0, &service)
             .await
             .expect_err("vanished container is not healthy");
         assert!(matches!(
@@ -651,7 +654,7 @@ mod tests {
             kind: ServiceKind::Postgres,
             pgvector: true,
         };
-        let _ = backend.spawn(&cluster_id, &worker, &service).await;
+        let _ = backend.spawn(&cluster_id, &worker, 3, &service).await;
 
         let created = runtime.created.lock().expect("lock");
         assert_eq!(created.len(), 1);
@@ -660,7 +663,7 @@ mod tests {
         assert_eq!(spec.run_as, Some((2005, 2005)));
         assert_eq!(
             spec.bind_mount.as_ref().expect("bind mount set").host_path,
-            "/var/lib/app_salmon/workers/salmon-worker-05"
+            "/var/lib/app_salmon/workers/salmon-worker-05/slot-3"
         );
         assert!(spec.env.iter().any(|(key, _)| key == "POSTGRES_PASSWORD"));
         assert_eq!(

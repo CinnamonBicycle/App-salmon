@@ -127,9 +127,11 @@ Per explicit decisions made before implementation began:
   replaced.
 - **Backend:** Postgres + pgvector only, one Docker container per cluster. No Supabase, no tar
   upload, no edge functions, no OpenRouter proxy.
-- **Sudo-based privilege separation is in scope now** (not deferred) — a bounded pool of
-  pre-provisioned Unix worker accounts (`salmon-worker-00`, `salmon-worker-01`, ...), one
-  allocated per cluster for its lifetime. See §6 for what this boundary actually provides.
+- **Sudo-based privilege separation is in scope now** (not deferred) — each configured client
+  runs its clusters as its own pre-provisioned Unix account (`config.toml`'s `unix_user`), per
+  the original design writeup, not a pool of interchangeable worker accounts shared across
+  clients (see §6, and §10.1 for why the implementation briefly diverged from this and was
+  brought back in line).
 - All 4 endpoints, the full cluster lifecycle state machine, the layered `thiserror` error
   hierarchy, structured `tracing` logging, SQLite-backed durable state with startup
   reconciliation, and a TTL reaper — all implemented and unit-tested against fakes, plus an e2e
@@ -152,7 +154,7 @@ src/
     ids.rs, service_kind.rs        # ClusterId (ULID), ClientId, WorkerUser, ServiceKind, ConnectionInfo
   ports/                            # trait seams: ContainerRuntime, PrivilegedExecutor, Clock, SecretGenerator, ClusterRepository, Filesystem
   adapters/                          # real impls: bollard, sudo Command::spawn, system clock, OsRng, rusqlite, tokio::fs
-  worker_pool.rs                      # bounded free-list of worker accounts
+  client_workers.rs                   # static per-client Unix-account mapping + directory-slot path helper
   backends/postgres.rs                  # the one real ClusterBackend impl (phase 1)
   service/
     cluster_service.rs                    # create/info/list/delete business rules (no I/O to Docker/sudo)
@@ -176,7 +178,7 @@ reconsidered. `Gone` is deliberately not a variant — it's the absence of a row
 act is deleting the row, which is what flips `GET /clusters/{id}` from `410` to `404`.
 
 A `Failed` state was added beyond the original writeup (image-pull failure, health-check timeout,
-worker-pool exhaustion mid-spawn all need somewhere to go) — `GET` returns `200` with a sanitized
+or a directory-preparation failure mid-spawn all need somewhere to go) — `GET` returns `200` with a sanitized
 error summary, not an error status, since a caller needs to be told to stop polling.
 
 **Quota counting:** every row in `{Spawning, Ready, Failed, Deleting}` counts against the 2/user
@@ -204,7 +206,7 @@ persisting `Ready`/`Failed` over it. See `service::spawn_task`'s
 
 `thiserror` enums sized to what each layer's *direct caller* needs to match on, composed via
 `#[from]`/`#[source]` — no `Box<dyn Error>`/`anyhow` anywhere. `DockerError`, `PrivilegedExecError`,
-`WorkerPoolError`, `RepositoryError`, `AuthError`, `ConfigError` at the bottom; `ClusterError` in
+`ClientWorkerError`, `RepositoryError`, `AuthError`, `ConfigError` at the bottom; `ClusterError` in
 the middle (what `ClusterService`'s callers match on); `ApiError` at the top — the only type with
 an `IntoResponse` impl, mapping 1:1 to HTTP status codes. `ClusterError -> ApiError` is a
 hand-written `From` (not `#[from]`) since it branches on the wrapped variant. Ownership checks are
@@ -228,25 +230,45 @@ has a real adapter and is fully unit-testable without touching the real external
 - **`adapters::sqlite_repository`**: tested against both an in-memory SQLite DB and a real file
   path (`open()`, not just `open_in_memory()`).
 
-## 6. Sudo/worker-pool security model — read this before assuming more than it provides
+## 6. Sudo/per-client-account security model — read this before assuming more than it provides
 
 `app_salmon`'s own `bollard` connection drives *all* container lifecycle (create/start/inspect/
 stop/remove) — `bollard` is an in-process async client, you cannot "sudo" a library call. Sudo
-(`sudo -u salmon-worker-NN`, via `PrivilegedExecutor`, restricted to a **closed enum** of two
+(`sudo -u <client's unix_user>`, via `PrivilegedExecutor`, restricted to a **closed enum** of two
 operations — `PrepareWorkerDir`/`WipeWorkerDir`, never arbitrary argv) is used only to
 create/own/wipe the per-cluster working directory that gets bind-mounted into the container,
-which is itself configured with `--user <worker-uid>:<worker-gid>`.
+which is itself configured with `--user <uid>:<gid>`.
 
-**What this phase-1 worker separation actually is: a file-ownership / attribution / blast-radius
+**Each configured client runs its clusters as its own Unix account (`config.toml`'s `unix_user`),
+not a pooled/shared account** — see §10.1 for why this matters and the (brief) history of the
+implementation diverging from it. A client can hold up to `max_clusters_per_user` clusters at
+once, so its account's directory is further scoped by a small **directory slot** (`0..
+max_clusters_per_user`, e.g. `slot-0`, `slot-1`), assigned atomically at cluster-creation time by
+`ClusterRepository::try_insert_if_under_quota` (the same transaction that enforces the quota —
+see §5's TOCTOU note; a free slot always exists whenever the owner is under quota, by pigeonhole).
+Fixed, literal, enumerable slot paths (rather than one directory per cluster id) are what let
+`scripts/setup-e2e-env.sh` write a `/etc/sudoers.d` rule listing exactly `max_clusters_per_user`
+allowed paths per client, with **no wildcard** — confirmed necessary, not merely tidier, in this
+session: `sudo-rs` (increasingly Ubuntu's default `sudo`, and what this development environment
+itself uses) rejects wildcards embedded in command arguments outright at `visudo -c` time
+(`syntax error: wildcards are not allowed in command arguments`), so a rule scoped by cluster id
+(unbounded, unenumerable) would have silently failed to install on any `sudo-rs` machine — the
+first cluster-directory sudo call would then hard-fail with a permission denial. See §8a for the
+verification status of everything else in this area.
+
+**What this phase-1 privilege separation actually is: a file-ownership / attribution / blast-radius
 boundary, not a container-escape boundary.** The Docker daemon itself still runs as root either
 way — a compromised Postgres container can still reach the daemon's root, because the daemon's
 root is the daemon's root regardless of which uid the container process runs as. This is
 acceptable *only* because phase-1 workloads are a trusted, pinned image (`pgvector/pgvector`), not
 LLM-authored code. What it does buy: every cluster's on-disk state has a distinct uid (a cleanup
-bug can't let cluster B read cluster A's leftover data directory), and `ps`/`lsof`/audit logs
-attribute activity to a specific worker id rather than an undifferentiated `app_salmon` — which
-matters for "centralize privilege in one *audited* service," a goal independent of container
-escape resistance.
+bug can't let cluster B read cluster A's leftover data directory), `ps`/`lsof`/audit logs
+attribute activity to a specific client's account rather than an undifferentiated `app_salmon`
+(which matters for "centralize privilege in one *audited* service," a goal independent of
+container escape resistance) — and, unlike a shared worker pool, **one client's account never
+runs code on another client's behalf**, so a capability eventually granted to one client's account
+(a real, confirmed future requirement — differentiated per-client capabilities) can't leak to a
+different client merely through account reuse.
 
 The real escape-resistance boundary is deferred to the Kata-Containers phase (§7c) — the same
 `ContainerRuntime` port gets re-targeted at a `runtime=kata` container spec, and *that* is where
@@ -278,25 +300,27 @@ exactly that gap (already implemented in phase 1; noted here for the record sinc
 question in the original design).
 
 **(f) Full admin/operator runbook.** Phase 1 ships `scripts/setup-e2e-env.sh` as a stub covering
-worker-account creation, the sudoers rule, and image pulling — a human still needs to: create the
-`app_salmon` service account itself, decide the production `worker_pool.size` (currently a
-config value with no capacity-planning guidance beyond "max_clusters_per_user × expected
-concurrent users"), and set up the actual daemon/process supervision (systemd unit, log
-directory permissions, etc.) for running `app_salmon` itself in production.
+per-client account creation, the sudoers rule, and image pulling — a human still needs to: create
+the `app_salmon` service account itself, provision one Unix account per real client (no capacity
+planning beyond that — unlike a shared pool, there's no separate "pool size" to plan, only
+`max_clusters_per_user` per client, which bounds that client's own directory-slot count), and set
+up the actual daemon/process supervision (systemd unit, log directory permissions, etc.) for
+running `app_salmon` itself in production.
 
 **(g) Revisit the 30s/3600s TTL bounds and the 2-per-user limit** once there's real usage data —
 both are still first-guess values from the original design writeup.
 
 ## 8. Operator prerequisites (stub — full runbook is deferred, §7f)
 
-- `scripts/setup-e2e-env.sh` (must run as root): creates `worker_pool.size` worker accounts named
-  `{worker_pool.user_prefix}00`, `01`, ... with fixed uids, writes a `/etc/sudoers.d/app-salmon`
-  rule scoped to exactly `mkdir -p <path>` and `find <path> -mindepth 1 -delete` against those
-  workers' data directories, and pulls the configured Postgres image.
+- `scripts/setup-e2e-env.sh` (must run as root): creates one Unix account per configured e2e
+  client, writes a `/etc/sudoers.d/app-salmon` rule scoped to exactly `mkdir -p <path>` and
+  `find <path> -mindepth 1 -delete` against that client's `max_clusters_per_user` literal
+  directory-slot paths (no wildcard — see §6 for why), and pulls the configured Postgres image.
 - The `app_salmon` config (`config.toml`) needs: a `[[clients]]` entry per client account, each
-  with `secret_hash = "sha256:<64 hex chars>"` — the hash of a secret generated and distributed to
-  that client account out of band (no CLI tooling for this yet — `sha256sum` a random string by
-  hand).
+  with `secret_hash = "sha256:<64 hex chars>"` (the hash of a secret generated and distributed to
+  that client account out of band — no CLI tooling for this yet, `sha256sum` a random string by
+  hand) and `unix_user = "<name>"` naming the pre-provisioned Unix account that client's clusters
+  run as (must be unique across clients — `Config::validate` rejects two clients sharing one).
 - The service needs read access to `/etc/passwd` (to resolve worker uid/gid), a writable
   `storage.sqlite_path` directory, a writable `logging.log_dir`, and access to the Docker socket
   (`docker.socket_path`).
@@ -327,20 +351,56 @@ run (see §9). The official images ship the full `postgresql-client` toolchain i
 `pg_isready`, so this is expected to hold, but — like the arbitrary-uid path above — has not been
 confirmed against a real image pull in this environment.
 
+**Newly verified this session, unlike the two risks above:** the `sudo-rs` wildcard rejection
+described in §6 *was* confirmed directly, via `visudo -c -f` against a hand-written sudoers
+snippet in this sandbox (no root needed for a syntax-only check) — first against a wildcard-based
+rule (`.../client/*`), which failed with `syntax error: wildcards are not allowed in command
+arguments`, then against the literal-slot-path rule actually shipped, which parsed cleanly. What's
+still unverified is *runtime* behavior on a real target machine: whether that machine's `sudo` is
+classic sudo or `sudo-rs` (both are plausible depending on the OS/version), and — for classic
+sudo — whether the literal, wildcard-free rule this session settled on is accepted identically
+(it should be, since it uses no wildcard syntax at all, but "should be" is not "confirmed", per
+the standard set by the rest of this section).
+
+**Load-bearing cross-artifact invariants — nothing in the codebase enforces these; they must be
+kept in sync by hand:**
+- `limits.max_clusters_per_user` in `config.toml` must equal `MAX_CLUSTERS_PER_USER` (env
+  `APP_SALMON_MAX_CLUSTERS_PER_USER`, default `2`) passed to `scripts/setup-e2e-env.sh`.
+  `try_insert_if_under_quota` assigns slots in `0..limits.max_clusters_per_user`; the script
+  pre-creates directories and sudoers entries for `0..MAX_CLUSTERS_PER_USER`. If the config value
+  is raised without re-running the script (or the script is run with a smaller value), a cluster
+  can be assigned a slot the script never provisioned — the row inserts successfully, and the
+  background spawn task's privileged `mkdir` for that slot is then denied by `sudo`/`sudo-rs` at
+  runtime. No unit test catches this: it's purely a config/script agreement, invisible until an
+  e2e run actually exhausts the lower slot count. Operators changing `max_clusters_per_user` must
+  re-run `scripts/setup-e2e-env.sh` (or the production equivalent) before the new limit takes
+  effect.
+- `storage.sqlite_path`'s parent directory (`<parent>/workers`, i.e. `worker_data_dir_base`) must
+  match `WORKER_DATA_DIR_BASE` (env `APP_SALMON_WORKER_DATA_DIR_BASE`) used by the same script —
+  otherwise the directories the script `chown`s and the sudoers rule authorizes are not the ones
+  the running server actually computes via `client_workers::worker_data_dir`, and every spawn
+  fails the same way.
+- Minor, edge-of-an-edge note: `try_insert_if_under_quota`'s slot-assignment step silently skips
+  any existing row whose persisted JSON fails to parse (`filter_map(...ok())`) when computing
+  `used_slots`, while the quota *count* above it still includes that row. A corrupt row could
+  therefore theoretically cause a new insert to be assigned a slot already in use by the corrupt
+  row. Not fixed here (no reproduction, no test infrastructure currently writes corrupt rows) —
+  flagged for awareness, not treated as a phase-1 blocker.
+
 ## 9. Testing & coverage
 
 - `just ci` — the single command: format check, clippy (deny-on-warnings, `--all-targets
-  --all-features`), unit tests, and the e2e suite *if* this machine has Docker + the worker
-  accounts provisioned (checked via `docker info` + `id salmon-worker-00`; if not, `just ci`
-  prints a clear message and does not silently skip — running it *without* those prerequisites is
-  expected to leave e2e unrun, not to fail).
+  --all-features`), unit tests, and the e2e suite *if* this machine has Docker + the e2e client
+  accounts provisioned (checked via `docker info` + `id e2e-agent`; if not, `just ci` prints a
+  clear message and does not silently skip — running it *without* those prerequisites is expected
+  to leave e2e unrun, not to fail).
 - `just test-unit` / `just test-e2e` / `just test-all` — independently runnable, per the
   requirement that unit and e2e stay separable.
 - `just coverage` (needs `cargo install cargo-llvm-cov` + `rustup component add
   llvm-tools-preview` once per machine) — measures the **entire** `--lib` target, no
-  `--ignore-filename-regex` carve-out for adapters. Current state (2026-07-12): 96.3% region /
-  98.0% line coverage — not literally 100%; see below for what accounts for the remaining ~120
-  lines and why each category is or isn't worth closing. Every adapter (`docker_bollard`,
+  `--ignore-filename-regex` carve-out for adapters. Current state (2026-07-12): 96.2% region /
+  97.8% line coverage — not literally 100%; see below for what accounts for the remaining lines
+  and why each category is or isn't worth closing. Every adapter (`docker_bollard`,
   `sudo_exec`, `sqlite_repository`, `tokio_filesystem`) is covered via a fake stand-in for the
   *external system* (fake Docker Engine API server, fake sudo script, real SQLite, real tempdir
   filesystem + an injectable fake for error paths), not just a Rust-level fake of the port trait —
@@ -398,6 +458,24 @@ confirmed against a real image pull in this environment.
   zero-cost (implementations still just write `async fn`), but the `Send` guarantee is now checked
   at the `impl` site instead of surfacing as a confusing error at an unrelated `tokio::spawn` call
   site. Verified with a standalone prototype before touching production code.
+- **The pooled worker-account subsystem was eliminated in favor of per-client accounts**
+  (2026-07-12) — see §6 and §10.1 for the design rationale. `src/worker_pool.rs` (bounded
+  free-list, acquire/release, `PoolExhausted`/`DoubleRelease` errors) is gone entirely; the
+  replacement, `src/client_workers.rs`, is a stateless static mapping with no acquire/release
+  lifecycle to test. This closed a real, unit-testable correctness gap discovered mid-change: two
+  concurrent creates for the same client can each hold up to `max_clusters_per_user` clusters, so
+  each cluster still needs its own on-disk directory — naming it by cluster id would have forced
+  the sudoers rule to use a wildcard, which `sudo-rs` rejects outright (§6, §8a). The fix — a
+  directory *slot* (`0..max_clusters_per_user`) assigned atomically inside the existing
+  `try_insert_if_under_quota` transaction, the smallest slot not already used by one of the
+  owner's other active rows — is covered by unit tests exercising exactly the property that
+  matters and can be verified in a sandboxed environment with no root/Docker:
+  `quota_holds_under_concurrent_creates` (strengthened to assert the two winners of 6 concurrent
+  same-owner inserts get distinct slots, not just that exactly 2 succeed) and
+  `a_freed_slot_is_reused_by_the_next_insert` in `adapters::sqlite_repository`, mirrored in
+  `test_support::InMemoryClusterRepository`'s own `try_insert_if_under_quota` impl so every
+  service-layer test gets the same guarantee. The `sudo-rs` finding itself was verified directly
+  in this sandbox via `visudo -c -f` (no root required for a syntax-only check) — see §8a.
 - **What's left, in three categories with different implications:**
   1. **Unreachable by design** (`cluster_service.rs:156`'s `?` after `transition(.., DeleteRequested)`
      — every `ClusterState` accepts `DeleteRequested`, so the error branch can't fire;
@@ -429,28 +507,43 @@ confirmed against a real image pull in this environment.
 
 ## 10. Open design questions carried forward
 
-1. **Config's client→worker mapping.** Workers are allocated from a shared pool at cluster-create
-   time, not statically mapped per client — flagging this because an earlier reading of the
-   requirements suggested a static mapping; the pool design was chosen deliberately (see the
-   original planning discussion) and this is the intended behavior, not a bug.
+1. **Config's client→worker mapping — resolved (2026-07-12), was briefly a deviation.** The
+   implementation originally allocated workers from a shared pool (`salmon-worker-00`, `01`, ...)
+   at cluster-create time rather than statically mapping one Unix account per client, flagged at
+   the time as "chosen deliberately" with no inline justification recorded. Revisited this session
+   and reverted to the original design writeup's actual intent (§2: `spawner_service` sudos to
+   "the users for each of the LLMs that can call it") once the underlying reason for a pooled
+   account surfaced a real problem: a pooled/recycled identity that runs code on behalf of
+   *multiple different clients* must carry the union of every capability any client it services
+   might need — a security hole in waiting once any capability needs to vary per client, which was
+   confirmed as a real, near-term requirement ("different client capabilities is DEFINITELY a
+   thing"), not a hypothetical. Per-client accounts also delete a whole subsystem
+   (`WorkerPool`'s acquire/release/exhaustion bookkeeping, `PoolExhausted`/`DoubleRelease` errors)
+   rather than requiring it to be threaded through and worked around in every future phase — see
+   §6 and §9 for the mechanics of what replaced it (`client_workers.rs`, directory slots).
 2. **TTL anchor.** `decommission_at = ready_at + requested_ttl`, where `ready_at` is set the
    moment the spawn task actually persists `Ready` — `GET` merely *reports* this, polling doesn't
    delay it. The alternative (clock starts at first poll) would let an unpolled-but-ready cluster
-   consume a quota slot and a worker forever, which is a resource leak, not a feature.
-3. **A crash-window gap in worker-release bookkeeping.** `teardown_task::teardown` releases the
-   worker back to the pool, then deletes the row, as two separate steps with no transaction
-   across them. If the process crashes in exactly that window, a restart's reconciliation pass
-   would see the (still-present) `Deleting` row referencing the worker and correctly keep it
-   marked in-use — but the worker was *already* released to the in-memory pool before the crash,
-   so nothing is actually lost; the row's continued existence is what reconciliation uses to
-   rebuild the free list correctly on the next start. Documented here because it was flagged
-   during design as worth carrying forward, even though re-analysis during implementation found
-   it self-corrects via reconciliation rather than actually leaking a worker.
+   consume a quota slot forever, which is a resource leak, not a feature.
+3. ~~A crash-window gap in worker-release bookkeeping~~ — **moot as of the per-client-account
+   change (2026-07-12).** This item described a two-step, non-transactional "release worker, then
+   delete row" sequence in `teardown_task::teardown` that a crash could interleave with. Per-client
+   accounts have no release step at all (an account is never returned to a shared pool — it's
+   always "the same client's account," full stop), and the replacement directory-slot assignment
+   is computed fresh from whichever rows are still persisted (via the same atomic
+   `try_insert_if_under_quota` transaction that assigns it), not from separate in-memory
+   bookkeeping that could drift from the database. Left here, struck through, rather than
+   silently deleted, since it was carried forward once already and a future reader auditing this
+   list should be able to see it was resolved by a structural change, not forgotten.
 4. **Orphan-container detection.** `teardown_task` proceeds to delete the row even if the
    backend's own teardown call failed (logged, not fatal) — the alternative (never deleting the
    row on a failed backend teardown) risks a row stuck in `Deleting` forever, permanently
    consuming a quota slot. This means a container that fails to tear down cleanly becomes
    invisible to reconciliation (which only checks "does this *row's* container look right," not
    "are there containers with no matching row"). No reverse-direction orphan sweep exists yet.
-5. **`worker_pool.size` capacity planning** has no guidance beyond "roughly
-   `max_clusters_per_user × expected concurrent users`" — revisit with real usage data (§7g).
+5. **Per-client account capacity planning** is now just "one Unix account per real client,
+   provisioned when that client is onboarded" — no separate pool-sizing question remains (unlike
+   the eliminated shared pool, whose size needed advance capacity planning independent of which
+   clients existed). `max_clusters_per_user` (how many directory slots a single client's account
+   needs) is still a first-guess value from the original design writeup — revisit with real usage
+   data (§7g).

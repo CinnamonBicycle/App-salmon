@@ -39,17 +39,23 @@ impl ClusterRepository for InMemoryClusterRepository {
         limit: u32,
     ) -> Result<InsertOutcome, RepositoryError> {
         let mut rows = self.rows.lock().expect("lock");
-        let current_count = u32::try_from(
-            rows.values()
-                .filter(|row| row.owner == cluster.owner)
-                .count(),
-        )
-        .unwrap_or(u32::MAX);
+        let owners_rows: Vec<&Cluster> = rows
+            .values()
+            .filter(|row| row.owner == cluster.owner)
+            .collect();
+        let current_count = u32::try_from(owners_rows.len()).unwrap_or(u32::MAX);
         if current_count >= limit {
             return Ok(InsertOutcome::QuotaExceeded { current_count });
         }
-        rows.insert(cluster.id, cluster.clone());
-        Ok(InsertOutcome::Inserted)
+        let used_slots: std::collections::HashSet<u32> =
+            owners_rows.iter().map(|row| row.slot).collect();
+        let slot = (0..limit)
+            .find(|candidate| !used_slots.contains(candidate))
+            .expect("a free slot exists whenever current_count < limit");
+        let mut to_store = cluster.clone();
+        to_store.slot = slot;
+        rows.insert(cluster.id, to_store);
+        Ok(InsertOutcome::Inserted { slot })
     }
 
     async fn get_owned(
@@ -165,6 +171,7 @@ impl ClusterBackend for HangingClusterBackend {
         &self,
         _cluster_id: &ClusterId,
         _worker: &WorkerUser,
+        _slot: u32,
         _service: &ServiceSpec,
     ) -> Result<ConnectionInfo, ClusterError> {
         std::future::pending().await
@@ -196,6 +203,7 @@ impl ClusterBackend for FastSucceedingClusterBackend {
         &self,
         _cluster_id: &ClusterId,
         _worker: &WorkerUser,
+        _slot: u32,
         _service: &ServiceSpec,
     ) -> Result<ConnectionInfo, ClusterError> {
         Ok(ConnectionInfo {

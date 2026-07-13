@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::client_workers::{ClientWorkerError, worker_data_dir};
 use crate::domain::cluster::{Cluster, ClusterError, ClusterEvent, ClusterState, transition};
 use crate::domain::service_kind::ConnectionInfo;
 use crate::ports::container_runtime::DockerError;
 use crate::ports::privileged_exec::PrivilegedCommand;
 use crate::service::deps::TaskDeps;
 use crate::service::teardown_task;
-use crate::worker_pool::{WorkerPoolError, worker_data_dir};
 
 /// Maps an internal spawn failure to a coarse, user-facing summary safe to persist on the
 /// cluster's `Failed` state and return from the API — never the raw error's `Display` text, which
@@ -41,10 +41,7 @@ fn sanitize(error: &ClusterError) -> String {
             "container exited unexpectedly during startup".to_string()
         }
         ClusterError::Docker(_) => "container creation failed".to_string(),
-        ClusterError::WorkerPool(WorkerPoolError::PoolExhausted { .. }) => {
-            "worker pool exhausted".to_string()
-        }
-        ClusterError::WorkerPool(_) => "worker preparation failed".to_string(),
+        ClusterError::ClientWorker(_) => "worker preparation failed".to_string(),
         ClusterError::Repository(_) => "internal storage error".to_string(),
         // Already a coarse, backend-chosen summary — see `ClusterError::BackendSpawnFailed`.
         ClusterError::BackendSpawnFailed(message) => message.clone(),
@@ -55,16 +52,17 @@ fn sanitize(error: &ClusterError) -> String {
     }
 }
 
-/// Acquires a worker, prepares its on-disk directory, and asks the cluster's registered backend
-/// to actually spawn it. This is the fallible core of a spawn attempt — `run` wraps this call in
-/// a `tokio::select!` against cancellation and handles persisting the outcome.
+/// Resolves the owner's Unix account, prepares its per-cluster on-disk directory, and asks the
+/// cluster's registered backend to actually spawn it. This is the fallible core of a spawn
+/// attempt — `run` wraps this call in a `tokio::select!` against cancellation and handles
+/// persisting the outcome.
 ///
 /// # Arguments
 ///
-/// - `deps`: shared task dependencies (repository, worker pool, privileged executor, registered
-///   backends, clock, worker data directory base).
-/// - `cluster`: the cluster being spawned; mutated in place to record the acquired `worker` once
-///   one is assigned, so the caller can use it for cleanup even if a later step fails.
+/// - `deps`: shared task dependencies (repository, client-worker mapping, privileged executor,
+///   registered backends, clock, worker data directory base).
+/// - `cluster`: the cluster being spawned; mutated in place to record the resolved `worker` once
+///   it's known, so the caller can use it for cleanup even if a later step fails.
 ///
 /// # Returns
 ///
@@ -73,10 +71,10 @@ fn sanitize(error: &ClusterError) -> String {
 /// # Errors
 ///
 /// Returns [`ClusterError::BackendSpawnFailed`] if no backend is registered for the cluster's
-/// service kind, a [`crate::worker_pool::WorkerPoolError`] (via `#[from]`) if the worker pool is
-/// exhausted or the privileged directory-preparation command fails, or whatever error the
-/// backend's own `spawn` call produces (including [`ClusterError::Repository`] if persisting the
-/// acquired worker fails).
+/// service kind, a [`crate::client_workers::ClientWorkerError`] (via `#[from]`) if the owner has
+/// no configured account or the privileged directory-preparation command fails, or whatever error
+/// the backend's own `spawn` call produces (including [`ClusterError::Repository`] if persisting
+/// the resolved worker fails).
 async fn do_spawn(deps: &TaskDeps, cluster: &mut Cluster) -> Result<ConnectionInfo, ClusterError> {
     let backend = deps
         .backends
@@ -88,11 +86,11 @@ async fn do_spawn(deps: &TaskDeps, cluster: &mut Cluster) -> Result<ConnectionIn
         })?
         .clone();
 
-    let worker = deps.worker_pool.acquire().await?;
+    let worker = deps.client_workers.get(&cluster.owner)?;
     cluster.worker = Some(worker.clone());
     deps.repository.set_worker(&cluster.id, &worker).await?;
 
-    let path = worker_data_dir(&deps.worker_data_dir_base, &worker);
+    let path = worker_data_dir(&deps.worker_data_dir_base, &worker, cluster.slot);
     deps.privileged_exec
         .run_as(
             &worker,
@@ -101,9 +99,11 @@ async fn do_spawn(deps: &TaskDeps, cluster: &mut Cluster) -> Result<ConnectionIn
             },
         )
         .await
-        .map_err(WorkerPoolError::Prepare)?;
+        .map_err(ClientWorkerError::Prepare)?;
 
-    backend.spawn(&cluster.id, &worker, &cluster.service).await
+    backend
+        .spawn(&cluster.id, &worker, cluster.slot, &cluster.service)
+        .await
 }
 
 /// Drives one cluster's spawn attempt to completion in the background: races [`do_spawn`] against
@@ -205,6 +205,7 @@ pub async fn run(deps: Arc<TaskDeps>, mut cluster: Cluster, cancel: Cancellation
 mod tests {
     use super::{run, sanitize};
     use crate::backends::ClusterBackend;
+    use crate::client_workers::{ClientWorkerError, ClientWorkers};
     use crate::domain::cluster::{Cluster, ClusterError, ClusterState, DeleteReason};
     use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
     use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
@@ -217,12 +218,21 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::service::deps::TaskDeps;
     use crate::test_support::InMemoryClusterRepository;
-    use crate::worker_pool::{WorkerPool, WorkerPoolError};
     use async_trait::async_trait;
     use chrono::{TimeDelta, Utc};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    const OWNER: &str = "agent";
+
+    fn client_workers(worker: Option<WorkerUser>) -> Arc<ClientWorkers> {
+        let mut map = HashMap::new();
+        if let Some(worker) = worker {
+            map.insert(ClientId::new(OWNER), worker);
+        }
+        Arc::new(ClientWorkers::new(map))
+    }
 
     struct ScriptedBackend {
         succeed: bool,
@@ -239,6 +249,7 @@ mod tests {
             &self,
             _cluster_id: &ClusterId,
             _worker: &WorkerUser,
+            _slot: u32,
             _service: &ServiceSpec,
         ) -> Result<ConnectionInfo, ClusterError> {
             if self.block_forever {
@@ -298,17 +309,18 @@ mod tests {
                 started_at: Utc::now(),
             },
             worker: None,
+            slot: 0,
         }
     }
 
     fn deps_with(
         backend: Arc<dyn ClusterBackend>,
-        workers: Vec<WorkerUser>,
+        worker: Option<WorkerUser>,
     ) -> (Arc<TaskDeps>, Arc<InMemoryClusterRepository>) {
         let repository = Arc::new(InMemoryClusterRepository::new());
         let deps = Arc::new(TaskDeps {
             repository: repository.clone(),
-            worker_pool: Arc::new(WorkerPool::new(workers)),
+            client_workers: client_workers(worker),
             privileged_exec: Arc::new(NoopExecutor),
             backends: HashMap::from([(ServiceKind::Postgres, backend)]),
             clock: Arc::new(FakeClock::new(Utc::now())),
@@ -319,12 +331,12 @@ mod tests {
 
     fn deps_with_repo(
         backend: Arc<dyn ClusterBackend>,
-        workers: Vec<WorkerUser>,
+        worker: Option<WorkerUser>,
         repository: Arc<dyn ClusterRepository>,
     ) -> Arc<TaskDeps> {
         Arc::new(TaskDeps {
             repository,
-            worker_pool: Arc::new(WorkerPool::new(workers)),
+            client_workers: client_workers(worker),
             privileged_exec: Arc::new(NoopExecutor),
             backends: HashMap::from([(ServiceKind::Postgres, backend)]),
             clock: Arc::new(FakeClock::new(Utc::now())),
@@ -339,7 +351,7 @@ mod tests {
             block_forever: false,
         });
         let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let (deps, repository) = deps_with(backend, vec![worker]);
+        let (deps, repository) = deps_with(backend, Some(worker));
 
         let cluster = spawning_cluster();
         repository
@@ -365,7 +377,7 @@ mod tests {
             block_forever: false,
         });
         let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let (deps, repository) = deps_with(backend, vec![worker]);
+        let (deps, repository) = deps_with(backend, Some(worker));
 
         let cluster = spawning_cluster();
         repository
@@ -389,13 +401,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_pool_exhaustion_persists_failed_state() {
+    async fn owner_with_no_configured_account_persists_failed_state() {
         let backend = Arc::new(ScriptedBackend {
             succeed: true,
             block_forever: false,
         });
-        // No workers configured at all -> acquire() fails immediately.
-        let (deps, repository) = deps_with(backend, vec![]);
+        // No client-worker mapping configured at all -> the lookup fails immediately. Not
+        // reachable via the real API (the owner was authenticated against the same client list
+        // this mapping is built from), but exercised defensively here.
+        let (deps, repository) = deps_with(backend, None);
 
         let cluster = spawning_cluster();
         repository
@@ -412,7 +426,7 @@ mod tests {
             .expect("row present");
         match stored.state {
             ClusterState::Failed { error_summary, .. } => {
-                assert_eq!(error_summary, "worker pool exhausted");
+                assert_eq!(error_summary, "worker preparation failed");
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -425,7 +439,7 @@ mod tests {
             block_forever: true,
         });
         let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let (deps, repository) = deps_with(backend, vec![worker]);
+        let (deps, repository) = deps_with(backend, Some(worker));
 
         let cluster = spawning_cluster();
         repository
@@ -451,7 +465,6 @@ mod tests {
                 .expect("query")
                 .is_none()
         );
-        assert_eq!(deps.worker_pool.free_count().await, 1);
     }
 
     #[tokio::test]
@@ -467,7 +480,7 @@ mod tests {
             block_forever: false,
         });
         let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let (deps, repository) = deps_with(backend, vec![worker]);
+        let (deps, repository) = deps_with(backend, Some(worker));
 
         let cluster = spawning_cluster();
         repository
@@ -495,7 +508,6 @@ mod tests {
                 .is_none(),
             "row should have been torn down, not left/overwritten as Ready"
         );
-        assert_eq!(deps.worker_pool.free_count().await, 1);
     }
 
     #[tokio::test]
@@ -504,7 +516,7 @@ mod tests {
         let repository = Arc::new(InMemoryClusterRepository::new());
         let deps = Arc::new(TaskDeps {
             repository: repository.clone(),
-            worker_pool: Arc::new(WorkerPool::new(vec![worker])),
+            client_workers: client_workers(Some(worker)),
             privileged_exec: Arc::new(NoopExecutor),
             backends: HashMap::new(),
             clock: Arc::new(FakeClock::new(Utc::now())),
@@ -562,18 +574,13 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_covers_every_worker_pool_error_branch() {
-        let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
+    fn sanitize_covers_every_client_worker_error_branch() {
         assert_eq!(
-            sanitize(&ClusterError::WorkerPool(WorkerPoolError::PoolExhausted {
-                pool_size: 4
-            })),
-            "worker pool exhausted"
-        );
-        assert_eq!(
-            sanitize(&ClusterError::WorkerPool(WorkerPoolError::DoubleRelease {
-                worker
-            })),
+            sanitize(&ClusterError::ClientWorker(
+                ClientWorkerError::UnknownClient {
+                    client: ClientId::new(OWNER)
+                }
+            )),
             "worker preparation failed"
         );
     }
@@ -609,7 +616,7 @@ mod tests {
             block_forever: false,
         });
         let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let (deps, repository) = deps_with(backend, vec![worker]);
+        let (deps, repository) = deps_with(backend, Some(worker));
 
         let cluster = spawning_cluster();
         repository
@@ -630,7 +637,6 @@ mod tests {
                 .expect("query")
                 .is_none()
         );
-        assert_eq!(deps.worker_pool.free_count().await, 1);
     }
 
     #[tokio::test]
@@ -658,7 +664,7 @@ mod tests {
             .withf(|_, state| matches!(state, ClusterState::Ready { .. }))
             .returning(|_, _| Ok(()));
 
-        let deps = deps_with_repo(backend, vec![worker], Arc::new(repository));
+        let deps = deps_with_repo(backend, Some(worker), Arc::new(repository));
 
         run(deps, cluster, CancellationToken::new()).await;
     }
@@ -685,7 +691,7 @@ mod tests {
             .withf(|_, state| matches!(state, ClusterState::Ready { .. }))
             .returning(|_, _| Err(RepositoryError::Migration("simulated failure".to_string())));
 
-        let deps = deps_with_repo(backend, vec![worker], Arc::new(repository));
+        let deps = deps_with_repo(backend, Some(worker), Arc::new(repository));
 
         // Must not panic even though the final persist fails.
         run(deps, cluster, CancellationToken::new()).await;
@@ -713,7 +719,7 @@ mod tests {
             .withf(|_, state| matches!(state, ClusterState::Failed { .. }))
             .returning(|_, _| Err(RepositoryError::Migration("simulated failure".to_string())));
 
-        let deps = deps_with_repo(backend, vec![worker], Arc::new(repository));
+        let deps = deps_with_repo(backend, Some(worker), Arc::new(repository));
 
         run(deps, cluster, CancellationToken::new()).await;
     }
@@ -729,7 +735,7 @@ mod tests {
             block_forever: false,
         });
         let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let (deps, repository) = deps_with(backend, vec![worker]);
+        let (deps, repository) = deps_with(backend, Some(worker));
 
         let cluster = spawning_cluster();
         repository
@@ -781,7 +787,7 @@ mod tests {
             block_forever: false,
         });
         let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let (deps, repository) = deps_with(backend, vec![worker]);
+        let (deps, repository) = deps_with(backend, Some(worker));
 
         let cluster = spawning_cluster();
         repository

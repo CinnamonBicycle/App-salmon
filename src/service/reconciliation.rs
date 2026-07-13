@@ -8,55 +8,34 @@
 //!   restart" }` rather than trying to resume them.
 //! - `Deleting` rows are always re-torn-down (idempotent, resumes cleanly whatever step a prior
 //!   process got interrupted at).
-//! - `Failed` rows are left alone — by design they keep holding their worker until the normal
+//! - `Failed` rows are left alone — by design they keep holding their directory until the normal
 //!   reaper grace period reaps them, restart or not.
-//!
-//! Also computes the worker pool's initial free list: the configured pool minus every worker
-//! still referenced by a row after the above (a `Failed` row's worker, or nothing at all).
-
-use std::collections::HashSet;
 
 use crate::domain::cluster::{ClusterState, DeleteReason};
-use crate::domain::ids::WorkerUser;
 use crate::service::deps::TaskDeps;
 use crate::service::teardown_task;
 
 /// Runs one reconciliation pass over every persisted cluster row, comparing it against real
-/// backend state and forcing it into a consistent state after a possible crash/restart (see the
-/// per-state policy in the module-level docs above), then computes the worker pool's initial free
-/// list from what's left referenced.
+/// backend state and forcing it into a consistent state after a possible crash/restart — see the
+/// per-state policy in the module-level docs above.
 ///
 /// # Arguments
 ///
 /// - `deps`: shared dependencies (repository, backends, clock, etc.) used to read and update
 ///   cluster rows and query backend liveness.
-/// - `configured_workers`: the full set of worker accounts this instance is configured to use, as
-///   read from `config.toml`'s `worker_pool` section.
-///
-/// # Returns
-///
-/// The subset of `configured_workers` not referenced by any row still holding a worker after
-/// reconciliation completes — the initial free list to seed `WorkerPool` with at startup.
 ///
 /// # Panics
 ///
 /// Never — failures are logged and the affected row is left for a later pass rather than
 /// aborting the whole reconciliation sweep.
-pub async fn run(deps: &TaskDeps, configured_workers: &[WorkerUser]) -> Vec<WorkerUser> {
+pub async fn run(deps: &TaskDeps) {
     let rows = match deps.repository.list_all().await {
         Ok(rows) => rows,
         Err(error) => {
-            tracing::error!(error = %error, "reconciliation failed to list clusters; treating the whole worker pool as free");
-            return configured_workers.to_vec();
+            tracing::error!(error = %error, "reconciliation failed to list clusters");
+            return;
         }
     };
-
-    let mut still_in_use: HashSet<WorkerUser> = HashSet::new();
-    for cluster in &rows {
-        if let Some(worker) = &cluster.worker {
-            still_in_use.insert(worker.clone());
-        }
-    }
 
     for cluster in rows {
         match &cluster.state {
@@ -79,9 +58,6 @@ pub async fn run(deps: &TaskDeps, configured_workers: &[WorkerUser]) -> Vec<Work
                     ..cluster
                 };
                 teardown_task::teardown(deps, &deleting_cluster).await;
-                if let Some(worker) = &deleting_cluster.worker {
-                    still_in_use.remove(worker);
-                }
             }
             ClusterState::Ready { .. } => {
                 let Some(backend) = deps.backends.get(&cluster.service.kind) else {
@@ -110,27 +86,19 @@ pub async fn run(deps: &TaskDeps, configured_workers: &[WorkerUser]) -> Vec<Work
             }
             ClusterState::Deleting { .. } => {
                 teardown_task::teardown(deps, &cluster).await;
-                if let Some(worker) = &cluster.worker {
-                    still_in_use.remove(worker);
-                }
             }
             ClusterState::Failed { .. } => {
-                // Left as-is: still holds its worker until the reaper's grace period passes.
+                // Left as-is: still holds its directory until the reaper's grace period passes.
             }
         }
     }
-
-    configured_workers
-        .iter()
-        .filter(|worker| !still_in_use.contains(worker))
-        .cloned()
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::run;
     use crate::backends::ClusterBackend;
+    use crate::client_workers::ClientWorkers;
     use crate::domain::cluster::{Cluster, ClusterError, ClusterState, DeleteReason};
     use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
     use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
@@ -139,7 +107,6 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::service::deps::TaskDeps;
     use crate::test_support::{InMemoryClusterRepository, NoopPrivilegedExecutor};
-    use crate::worker_pool::WorkerPool;
     use async_trait::async_trait;
     use chrono::{TimeDelta, Utc};
     use std::collections::HashMap;
@@ -160,6 +127,7 @@ mod tests {
             &self,
             _cluster_id: &ClusterId,
             _worker: &WorkerUser,
+            _slot: u32,
             _service: &ServiceSpec,
         ) -> Result<ConnectionInfo, ClusterError> {
             unreachable!("reconciliation tests never call spawn")
@@ -186,17 +154,15 @@ mod tests {
             requested_at: Utc::now(),
             state,
             worker,
+            slot: 0,
         }
     }
 
-    fn deps(
-        backend_alive: bool,
-        workers: Vec<WorkerUser>,
-    ) -> (Arc<TaskDeps>, Arc<InMemoryClusterRepository>) {
+    fn deps(backend_alive: bool) -> (Arc<TaskDeps>, Arc<InMemoryClusterRepository>) {
         let repository = Arc::new(InMemoryClusterRepository::new());
         let deps = Arc::new(TaskDeps {
             repository: repository.clone(),
-            worker_pool: Arc::new(WorkerPool::new(workers)),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: Arc::new(NoopPrivilegedExecutor),
             backends: HashMap::from([(
                 ServiceKind::Postgres,
@@ -212,20 +178,20 @@ mod tests {
 
     #[tokio::test]
     async fn stuck_spawning_cluster_is_forced_to_deleting_and_torn_down() {
-        let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let (deps, repository) = deps(true, vec![]);
+        let worker = WorkerUser::new("openbrain-agent", 2000, 2000);
+        let (deps, repository) = deps(true);
         let cluster = base_cluster(
             ClusterState::Spawning {
                 started_at: Utc::now(),
             },
-            Some(worker.clone()),
+            Some(worker),
         );
         repository
             .try_insert_if_under_quota(&cluster, 10)
             .await
             .expect("seed row");
 
-        let free = run(&deps, std::slice::from_ref(&worker)).await;
+        run(&deps).await;
 
         assert!(
             repository
@@ -234,12 +200,11 @@ mod tests {
                 .expect("query")
                 .is_none()
         );
-        assert_eq!(free, vec![worker]);
     }
 
     #[tokio::test]
     async fn ready_cluster_with_live_backend_is_left_alone() {
-        let (deps, repository) = deps(true, vec![]);
+        let (deps, repository) = deps(true);
         let connection = ConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: 5432,
@@ -260,7 +225,7 @@ mod tests {
             .await
             .expect("seed row");
 
-        run(&deps, &[]).await;
+        run(&deps).await;
 
         let stored = repository
             .get_any(&cluster.id)
@@ -272,7 +237,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_cluster_with_dead_backend_becomes_failed() {
-        let (deps, repository) = deps(false, vec![]);
+        let (deps, repository) = deps(false);
         let connection = ConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: 5432,
@@ -293,7 +258,7 @@ mod tests {
             .await
             .expect("seed row");
 
-        run(&deps, &[]).await;
+        run(&deps).await;
 
         let stored = repository
             .get_any(&cluster.id)
@@ -310,21 +275,21 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_cluster_is_always_re_torn_down() {
-        let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let (deps, repository) = deps(true, vec![]);
+        let worker = WorkerUser::new("openbrain-agent", 2000, 2000);
+        let (deps, repository) = deps(true);
         let cluster = base_cluster(
             ClusterState::Deleting {
                 deleting_since: Utc::now(),
                 reason: DeleteReason::UserRequested,
             },
-            Some(worker.clone()),
+            Some(worker),
         );
         repository
             .try_insert_if_under_quota(&cluster, 10)
             .await
             .expect("seed row");
 
-        let free = run(&deps, std::slice::from_ref(&worker)).await;
+        run(&deps).await;
 
         assert!(
             repository
@@ -333,49 +298,32 @@ mod tests {
                 .expect("query")
                 .is_none()
         );
-        assert_eq!(free, vec![worker]);
     }
 
     #[tokio::test]
-    async fn failed_cluster_keeps_its_worker_reserved() {
-        let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
-        let (deps, repository) = deps(true, vec![]);
+    async fn failed_cluster_is_left_alone() {
+        let worker = WorkerUser::new("openbrain-agent", 2000, 2000);
+        let (deps, repository) = deps(true);
         let cluster = base_cluster(
             ClusterState::Failed {
                 failed_at: Utc::now(),
                 error_summary: "boom".to_string(),
             },
-            Some(worker.clone()),
+            Some(worker),
         );
         repository
             .try_insert_if_under_quota(&cluster, 10)
             .await
             .expect("seed row");
 
-        let free = run(&deps, std::slice::from_ref(&worker)).await;
+        run(&deps).await;
 
-        assert!(
-            free.is_empty(),
-            "the Failed cluster's worker should stay reserved"
-        );
         let stored = repository
             .get_any(&cluster.id)
             .await
             .expect("query")
             .expect("row still present");
         assert!(matches!(stored.state, ClusterState::Failed { .. }));
-    }
-
-    #[tokio::test]
-    async fn unreferenced_workers_are_all_free() {
-        let workers: Vec<WorkerUser> = (0u32..3)
-            .map(|i| WorkerUser::new(format!("salmon-worker-{i:02}"), 2000 + i, 2000 + i))
-            .collect();
-        let (deps, _repository) = deps(true, vec![]);
-
-        let free = run(&deps, &workers).await;
-
-        assert_eq!(free.len(), 3);
     }
 
     /// Wraps `InMemoryClusterRepository`, letting tests inject a failure from specific methods —
@@ -448,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_all_failure_treats_the_whole_pool_as_free() {
+    async fn list_all_failure_is_logged_and_the_sweep_is_skipped() {
         let repository = Arc::new(FlakyRepository {
             inner: InMemoryClusterRepository::new(),
             fail_list_all: AtomicBool::new(true),
@@ -456,18 +404,15 @@ mod tests {
         });
         let deps = TaskDeps {
             repository,
-            worker_pool: Arc::new(WorkerPool::new(vec![])),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: Arc::new(NoopPrivilegedExecutor),
             backends: HashMap::new(),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
         };
-        let workers: Vec<WorkerUser> = (0u32..2)
-            .map(|i| WorkerUser::new(format!("salmon-worker-{i:02}"), 2000 + i, 2000 + i))
-            .collect();
 
-        let free = run(&deps, &workers).await;
-        assert_eq!(free, workers);
+        // Must not panic even though list_all fails.
+        run(&deps).await;
     }
 
     #[tokio::test]
@@ -477,12 +422,12 @@ mod tests {
             fail_list_all: AtomicBool::new(false),
             fail_update_state: AtomicBool::new(true),
         });
-        let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
+        let worker = WorkerUser::new("openbrain-agent", 2000, 2000);
         let cluster = base_cluster(
             ClusterState::Spawning {
                 started_at: Utc::now(),
             },
-            Some(worker.clone()),
+            Some(worker),
         );
         repository
             .try_insert_if_under_quota(&cluster, 10)
@@ -491,7 +436,7 @@ mod tests {
 
         let deps = TaskDeps {
             repository: repository.clone(),
-            worker_pool: Arc::new(WorkerPool::new(vec![])),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: Arc::new(NoopPrivilegedExecutor),
             backends: HashMap::new(),
             clock: Arc::new(FakeClock::new(Utc::now())),
@@ -499,11 +444,7 @@ mod tests {
         };
 
         // Doesn't panic; the row is left as-is (still Spawning) since the update failed.
-        let free = run(&deps, std::slice::from_ref(&worker)).await;
-        assert!(
-            free.is_empty(),
-            "worker still considered in-use since the row wasn't updated"
-        );
+        run(&deps).await;
         let stored = repository
             .get_any(&cluster.id)
             .await
@@ -541,7 +482,7 @@ mod tests {
 
         let deps = TaskDeps {
             repository: repository.clone(),
-            worker_pool: Arc::new(WorkerPool::new(vec![])),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: Arc::new(NoopPrivilegedExecutor),
             backends: HashMap::from([(
                 ServiceKind::Postgres,
@@ -553,7 +494,7 @@ mod tests {
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
         };
 
-        run(&deps, &[]).await;
+        run(&deps).await;
         let stored = repository
             .get_any(&cluster.id)
             .await
@@ -577,6 +518,7 @@ mod tests {
             &self,
             _cluster_id: &ClusterId,
             _worker: &WorkerUser,
+            _slot: u32,
             _service: &ServiceSpec,
         ) -> Result<ConnectionInfo, ClusterError> {
             unreachable!("reconciliation tests never call spawn")
@@ -618,7 +560,7 @@ mod tests {
 
         let deps = TaskDeps {
             repository: repository.clone(),
-            worker_pool: Arc::new(WorkerPool::new(vec![])),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: Arc::new(NoopPrivilegedExecutor),
             backends: HashMap::from([(
                 ServiceKind::Postgres,
@@ -628,7 +570,7 @@ mod tests {
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
         };
 
-        run(&deps, &[]).await;
+        run(&deps).await;
         let stored = repository
             .get_any(&cluster.id)
             .await
@@ -662,14 +604,14 @@ mod tests {
 
         let deps = TaskDeps {
             repository: repository.clone(),
-            worker_pool: Arc::new(WorkerPool::new(vec![])),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: Arc::new(NoopPrivilegedExecutor),
             backends: HashMap::new(),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
         };
 
-        run(&deps, &[]).await;
+        run(&deps).await;
         let stored = repository
             .get_any(&cluster.id)
             .await

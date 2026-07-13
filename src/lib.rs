@@ -12,6 +12,7 @@
 pub mod adapters;
 pub mod auth;
 pub mod backends;
+pub mod client_workers;
 pub mod config;
 pub mod domain;
 pub mod error;
@@ -22,4 +23,3 @@ pub mod service;
 pub mod telemetry;
 #[cfg(test)]
 mod test_support;
-pub mod worker_pool;

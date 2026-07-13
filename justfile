@@ -6,10 +6,10 @@
 ci: fmt-check lint test-unit
     #!/usr/bin/env bash
     set -euo pipefail
-    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && id salmon-worker-00 >/dev/null 2>&1; then
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && id e2e-agent >/dev/null 2>&1; then
         just test-e2e
     else
-        echo "e2e prerequisites not detected (docker reachable + salmon-worker-00 provisioned)."
+        echo "e2e prerequisites not detected (docker reachable + e2e-agent account provisioned)."
         echo "Run 'sudo ./scripts/setup-e2e-env.sh' then 'just test-e2e' to run the full suite."
     fi
 
@@ -31,7 +31,8 @@ test-unit:
 
 # End-to-end suite (`tests/e2e`) — requires `sudo ./scripts/setup-e2e-env.sh` to have been run on
 # this machine first. Fails loudly (not silently) if prerequisites are missing; single-threaded
-# since tests share a small fixed pool of real worker accounts.
+# since most tests share one client account's max_clusters_per_user quota, and parallel test
+# functions creating clusters against the same account would spuriously race each other's quota.
 test-e2e:
     cargo test --test e2e -- --test-threads=1
 

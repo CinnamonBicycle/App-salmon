@@ -141,11 +141,12 @@ impl fmt::Display for ClientId {
     }
 }
 
-/// A worker account allocated from the pool (e.g. `salmon-worker-03`) — `app_salmon` uses
-/// `sudo -u <name>` to prepare/wipe that worker's per-cluster directory, and Docker's
-/// `--user <uid>:<gid>` to run the cluster's container as that account. Both the name (for sudo)
-/// and the numeric ids (for Docker, which can't resolve a host-only account name inside the
-/// container) are needed, so this carries all three rather than just the name — see
+/// The Unix account a client's clusters run as — one per client, resolved once at startup from
+/// that client's configured `unix_user` (see `client_workers::ClientWorkers`). `app_salmon` uses
+/// `sudo -u <name>` to prepare/wipe a cluster's per-cluster directory under that account, and
+/// Docker's `--user <uid>:<gid>` to run the cluster's container as that account. Both the name
+/// (for sudo) and the numeric ids (for Docker, which can't resolve a host-only account name inside
+/// the container) are needed, so this carries all three rather than just the name — see
 /// `adapters::system_users` for how they're resolved from the account name at startup.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WorkerUser {

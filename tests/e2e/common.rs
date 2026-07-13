@@ -13,6 +13,7 @@ use app_salmon::auth::ClientRegistry;
 use app_salmon::auth::hashing::SecretHash;
 use app_salmon::backends::ClusterBackend;
 use app_salmon::backends::postgres::PostgresBackend;
+use app_salmon::client_workers::ClientWorkers;
 use app_salmon::domain::ids::ClientId;
 use app_salmon::domain::service_kind::ServiceKind;
 use app_salmon::http::{AppState, router};
@@ -20,11 +21,8 @@ use app_salmon::ports::container_runtime::{ContainerHandle, ContainerRuntime};
 use app_salmon::service::cluster_service::{ClusterService, Limits};
 use app_salmon::service::deps::{TaskDeps, TaskRegistry};
 use app_salmon::service::{reconciliation, ttl_reaper};
-use app_salmon::worker_pool::WorkerPool;
 use chrono::TimeDelta;
 
-const WORKER_PREFIX: &str = "salmon-worker-";
-const WORKER_COUNT: usize = 4;
 const POSTGRES_IMAGE: &str = "pgvector/pgvector:pg16";
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 const WORKER_DATA_DIR_BASE: &str = "/var/lib/app_salmon/workers";
@@ -34,6 +32,18 @@ pub const OTHER_CLIENT_NAME: &str = "e2e-agent-other";
 pub const OTHER_CLIENT_SECRET: &str = "e2e-other-secret-do-not-use-in-prod";
 const REMEDIATION: &str =
     "\n\nRun `sudo ./scripts/setup-e2e-env.sh` first, then re-run `just test-e2e`.";
+
+/// The e2e suite's two test clients, paired with the Unix account each one runs as — the account
+/// name is the client name itself, provisioned by `scripts/setup-e2e-env.sh`.
+fn configured_clients() -> Vec<(ClientId, String)> {
+    vec![
+        (ClientId::new(CLIENT_NAME), CLIENT_NAME.to_string()),
+        (
+            ClientId::new(OTHER_CLIENT_NAME),
+            OTHER_CLIENT_NAME.to_string(),
+        ),
+    ]
+}
 
 pub struct TestServer {
     pub base_url: String,
@@ -66,19 +76,15 @@ pub async fn ensure_prerequisites() {
         panic!("docker daemon at {DOCKER_SOCKET} did not respond: {err}{REMEDIATION}");
     }
 
-    let workers = match system_users::resolve_worker_users(
-        Path::new("/etc/passwd"),
-        WORKER_PREFIX,
-        WORKER_COUNT,
-    )
-    .await
-    {
-        Ok(workers) => workers,
-        Err(err) => panic!("worker accounts not provisioned: {err}{REMEDIATION}"),
-    };
+    let clients = configured_clients();
+    let workers =
+        match system_users::resolve_client_workers(Path::new("/etc/passwd"), &clients).await {
+            Ok(workers) => workers,
+            Err(err) => panic!("client accounts not provisioned: {err}{REMEDIATION}"),
+        };
     let first_worker = workers
-        .first()
-        .unwrap_or_else(|| panic!("WORKER_COUNT is 0{REMEDIATION}"));
+        .get(&clients[0].0)
+        .unwrap_or_else(|| panic!("no account resolved for {}{REMEDIATION}", clients[0].0));
 
     let status = tokio::process::Command::new("sudo")
         .args(["-n", "-u", first_worker.as_str(), "true"])
@@ -121,28 +127,20 @@ pub async fn spawn_test_server() -> TestServer {
     let mut backends: HashMap<ServiceKind, Arc<dyn ClusterBackend>> = HashMap::new();
     backends.insert(ServiceKind::Postgres, postgres_backend);
 
-    let configured_workers =
-        system_users::resolve_worker_users(Path::new("/etc/passwd"), WORKER_PREFIX, WORKER_COUNT)
+    let client_workers =
+        system_users::resolve_client_workers(Path::new("/etc/passwd"), &configured_clients())
             .await
-            .expect("resolve workers");
+            .expect("resolve client accounts");
 
     let task_deps = Arc::new(TaskDeps {
         repository: repository.clone(),
-        worker_pool: Arc::new(WorkerPool::new(vec![])),
+        client_workers: Arc::new(ClientWorkers::new(client_workers)),
         privileged_exec,
         backends,
         clock: clock.clone(),
         worker_data_dir_base: PathBuf::from(WORKER_DATA_DIR_BASE),
     });
-    let free_workers = reconciliation::run(&task_deps, &configured_workers).await;
-    let task_deps = Arc::new(TaskDeps {
-        repository: task_deps.repository.clone(),
-        worker_pool: Arc::new(WorkerPool::new(free_workers)),
-        privileged_exec: task_deps.privileged_exec.clone(),
-        backends: task_deps.backends.clone(),
-        clock: task_deps.clock.clone(),
-        worker_data_dir_base: task_deps.worker_data_dir_base.clone(),
-    });
+    reconciliation::run(&task_deps).await;
 
     let cluster_service = Arc::new(ClusterService::new(
         repository.clone(),

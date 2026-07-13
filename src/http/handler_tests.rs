@@ -18,6 +18,7 @@ use tower::ServiceExt;
 use crate::auth::ClientRegistry;
 use crate::auth::hashing::SecretHash;
 use crate::backends::ClusterBackend;
+use crate::client_workers::ClientWorkers;
 use crate::domain::cluster::ClusterState;
 use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
 use crate::domain::service_kind::{ConnectionInfo, ServiceKind};
@@ -31,19 +32,17 @@ use crate::test_support::{
     FakeSecretGenerator, FastSucceedingClusterBackend, HangingClusterBackend,
     InMemoryClusterRepository, NoopPrivilegedExecutor,
 };
-use crate::worker_pool::WorkerPool;
 
 const CLIENT_NAME: &str = "test-agent";
 const CLIENT_SECRET: &str = "test-secret";
 const OTHER_CLIENT_NAME: &str = "other-agent";
 const OTHER_CLIENT_SECRET: &str = "other-secret";
 
-fn test_app(workers: Vec<WorkerUser>) -> (Router, Arc<InMemoryClusterRepository>, Arc<FakeClock>) {
-    test_app_with_backend(workers, Arc::new(HangingClusterBackend))
+fn test_app() -> (Router, Arc<InMemoryClusterRepository>, Arc<FakeClock>) {
+    test_app_with_backend(Arc::new(HangingClusterBackend))
 }
 
 fn test_app_with_backend(
-    workers: Vec<WorkerUser>,
     backend: Arc<dyn ClusterBackend>,
 ) -> (Router, Arc<InMemoryClusterRepository>, Arc<FakeClock>) {
     let repository = Arc::new(InMemoryClusterRepository::new());
@@ -67,9 +66,22 @@ fn test_app_with_backend(
     );
     let client_registry = Arc::new(ClientRegistry::new(clients));
 
+    // Every test client gets its own account (mirroring one `[[clients]]` entry each in real
+    // config) — no test in this file exercises "owner has no configured account" (that's covered
+    // directly in `service::spawn_task`'s own unit tests).
+    let mut client_workers = HashMap::new();
+    client_workers.insert(
+        ClientId::new(CLIENT_NAME),
+        WorkerUser::new(CLIENT_NAME, 2000, 2000),
+    );
+    client_workers.insert(
+        ClientId::new(OTHER_CLIENT_NAME),
+        WorkerUser::new(OTHER_CLIENT_NAME, 2001, 2001),
+    );
+
     let task_deps = Arc::new(TaskDeps {
         repository: repository.clone(),
-        worker_pool: Arc::new(WorkerPool::new(workers)),
+        client_workers: Arc::new(ClientWorkers::new(client_workers)),
         privileged_exec: Arc::new(NoopPrivilegedExecutor),
         backends: HashMap::from([(ServiceKind::Postgres, backend)]),
         clock: clock.clone(),
@@ -128,8 +140,7 @@ async fn create_cluster(app: &Router, ttl_secs: i64) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn create_cluster_valid_request_is_accepted_as_spawning() {
-    let (app, _repository, _clock) =
-        test_app(vec![WorkerUser::new("salmon-worker-00", 2000, 2000)]);
+    let (app, _repository, _clock) = test_app();
     let (status, body) = create_cluster(&app, 300).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(body["status"], "spawning");
@@ -138,7 +149,7 @@ async fn create_cluster_valid_request_is_accepted_as_spawning() {
 
 #[tokio::test]
 async fn create_cluster_without_credentials_is_unauthorized() {
-    let (app, _repository, _clock) = test_app(vec![]);
+    let (app, _repository, _clock) = test_app();
     let request = Request::builder()
         .method("POST")
         .uri("/clusters")
@@ -154,7 +165,7 @@ async fn create_cluster_without_credentials_is_unauthorized() {
 
 #[tokio::test]
 async fn create_cluster_with_wrong_secret_is_unauthorized() {
-    let (app, _repository, _clock) = test_app(vec![]);
+    let (app, _repository, _clock) = test_app();
     let request = Request::builder()
         .method("POST")
         .uri("/clusters")
@@ -174,24 +185,21 @@ async fn create_cluster_with_wrong_secret_is_unauthorized() {
 
 #[tokio::test]
 async fn create_cluster_ttl_below_minimum_is_bad_request() {
-    let (app, _repository, _clock) = test_app(vec![]);
+    let (app, _repository, _clock) = test_app();
     let (status, _body) = create_cluster(&app, 5).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn create_cluster_ttl_above_maximum_is_bad_request() {
-    let (app, _repository, _clock) = test_app(vec![]);
+    let (app, _repository, _clock) = test_app();
     let (status, _body) = create_cluster(&app, 10_000).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn create_cluster_beyond_quota_is_too_many_requests() {
-    let (app, _repository, _clock) = test_app(vec![
-        WorkerUser::new("salmon-worker-00", 2000, 2000),
-        WorkerUser::new("salmon-worker-01", 2001, 2001),
-    ]);
+    let (app, _repository, _clock) = test_app();
     let (first_status, _) = create_cluster(&app, 300).await;
     let (second_status, _) = create_cluster(&app, 300).await;
     let (third_status, _) = create_cluster(&app, 300).await;
@@ -202,7 +210,7 @@ async fn create_cluster_beyond_quota_is_too_many_requests() {
 
 #[tokio::test]
 async fn get_cluster_unknown_id_is_not_found() {
-    let (app, _repository, _clock) = test_app(vec![]);
+    let (app, _repository, _clock) = test_app();
     let request = Request::builder()
         .method("GET")
         .uri(format!("/clusters/{}", ClusterId::new(ulid::Ulid::nil())))
@@ -215,8 +223,7 @@ async fn get_cluster_unknown_id_is_not_found() {
 
 #[tokio::test]
 async fn get_cluster_owned_by_someone_else_is_not_found() {
-    let (app, _repository, _clock) =
-        test_app(vec![WorkerUser::new("salmon-worker-00", 2000, 2000)]);
+    let (app, _repository, _clock) = test_app();
     let (_, created) = create_cluster(&app, 300).await;
     let id = created["id"].as_str().expect("id present");
 
@@ -232,8 +239,7 @@ async fn get_cluster_owned_by_someone_else_is_not_found() {
 
 #[tokio::test]
 async fn get_cluster_while_spawning_returns_200() {
-    let (app, _repository, _clock) =
-        test_app(vec![WorkerUser::new("salmon-worker-00", 2000, 2000)]);
+    let (app, _repository, _clock) = test_app();
     let (_, created) = create_cluster(&app, 300).await;
     let id = created["id"].as_str().expect("id present");
 
@@ -251,7 +257,7 @@ async fn get_cluster_while_spawning_returns_200() {
 
 #[tokio::test]
 async fn get_cluster_ready_returns_200_with_connection_info() {
-    let (app, repository, clock) = test_app(vec![WorkerUser::new("salmon-worker-00", 2000, 2000)]);
+    let (app, repository, clock) = test_app();
     let (_, created) = create_cluster(&app, 300).await;
     let id_str = created["id"].as_str().expect("id present").to_string();
     let id: ClusterId = id_str.parse().expect("valid ulid");
@@ -291,7 +297,7 @@ async fn get_cluster_ready_returns_200_with_connection_info() {
 
 #[tokio::test]
 async fn get_cluster_failed_returns_200_with_sanitized_error() {
-    let (app, repository, clock) = test_app(vec![WorkerUser::new("salmon-worker-00", 2000, 2000)]);
+    let (app, repository, clock) = test_app();
     let (_, created) = create_cluster(&app, 300).await;
     let id_str = created["id"].as_str().expect("id present").to_string();
     let id: ClusterId = id_str.parse().expect("valid ulid");
@@ -322,7 +328,7 @@ async fn get_cluster_failed_returns_200_with_sanitized_error() {
 
 #[tokio::test]
 async fn get_cluster_deleting_returns_410() {
-    let (app, repository, clock) = test_app(vec![WorkerUser::new("salmon-worker-00", 2000, 2000)]);
+    let (app, repository, clock) = test_app();
     let (_, created) = create_cluster(&app, 300).await;
     let id_str = created["id"].as_str().expect("id present").to_string();
     let id: ClusterId = id_str.parse().expect("valid ulid");
@@ -350,8 +356,7 @@ async fn get_cluster_deleting_returns_410() {
 
 #[tokio::test]
 async fn list_clusters_returns_only_the_callers_clusters() {
-    let (app, _repository, _clock) =
-        test_app(vec![WorkerUser::new("salmon-worker-00", 2000, 2000)]);
+    let (app, _repository, _clock) = test_app();
     create_cluster(&app, 300).await;
 
     let other_create = Request::builder()
@@ -383,7 +388,7 @@ async fn list_clusters_returns_only_the_callers_clusters() {
 
 #[tokio::test]
 async fn delete_unknown_cluster_is_not_found() {
-    let (app, _repository, _clock) = test_app(vec![]);
+    let (app, _repository, _clock) = test_app();
     let request = Request::builder()
         .method("DELETE")
         .uri(format!("/clusters/{}", ClusterId::new(ulid::Ulid::nil())))
@@ -396,8 +401,7 @@ async fn delete_unknown_cluster_is_not_found() {
 
 #[tokio::test]
 async fn delete_cluster_is_accepted_and_idempotent() {
-    let (app, _repository, _clock) =
-        test_app(vec![WorkerUser::new("salmon-worker-00", 2000, 2000)]);
+    let (app, _repository, _clock) = test_app();
     let (_, created) = create_cluster(&app, 300).await;
     let id_str = created["id"].as_str().expect("id present").to_string();
 
@@ -426,8 +430,7 @@ async fn delete_cluster_is_accepted_and_idempotent() {
 
 #[tokio::test]
 async fn delete_someone_elses_cluster_is_not_found() {
-    let (app, _repository, _clock) =
-        test_app(vec![WorkerUser::new("salmon-worker-00", 2000, 2000)]);
+    let (app, _repository, _clock) = test_app();
     let (_, created) = create_cluster(&app, 300).await;
     let id_str = created["id"].as_str().expect("id present").to_string();
 
@@ -447,10 +450,7 @@ async fn create_cluster_background_spawn_task_runs_to_completion() {
     // isn't racing the background task), this uses a backend that actually finishes — exercising
     // `launch_spawn`'s wrapper all the way through, including the task-registry unregister call
     // that only happens once `spawn_task::run` returns.
-    let (app, _repository, _clock) = test_app_with_backend(
-        vec![WorkerUser::new("salmon-worker-00", 2000, 2000)],
-        Arc::new(FastSucceedingClusterBackend),
-    );
+    let (app, _repository, _clock) = test_app_with_backend(Arc::new(FastSucceedingClusterBackend));
     let (_, created) = create_cluster(&app, 300).await;
     let id = created["id"].as_str().expect("id present").to_string();
 
@@ -481,10 +481,7 @@ async fn delete_ready_cluster_starts_a_teardown_task() {
     // This exercises the other branch, `DeleteOutcome::StartTeardown`, which only fires for a
     // cluster that isn't `Spawning` — so this uses the fast-succeeding backend to actually reach
     // `Ready` first.
-    let (app, _repository, _clock) = test_app_with_backend(
-        vec![WorkerUser::new("salmon-worker-00", 2000, 2000)],
-        Arc::new(FastSucceedingClusterBackend),
-    );
+    let (app, _repository, _clock) = test_app_with_backend(Arc::new(FastSucceedingClusterBackend));
     let (_, created) = create_cluster(&app, 300).await;
     let id = created["id"].as_str().expect("id present").to_string();
 
@@ -542,7 +539,7 @@ async fn delete_ready_cluster_starts_a_teardown_task() {
 
 #[tokio::test]
 async fn openapi_json_is_served_and_documents_the_cluster_routes() {
-    let (app, _repository, _clock) = test_app(vec![]);
+    let (app, _repository, _clock) = test_app();
     let request = Request::builder()
         .method("GET")
         .uri("/openapi.json")
@@ -566,7 +563,7 @@ async fn openapi_json_is_served_and_documents_the_cluster_routes() {
 
 #[tokio::test]
 async fn root_serves_swagger_ui_rather_than_404ing() {
-    let (app, _repository, _clock) = test_app(vec![]);
+    let (app, _repository, _clock) = test_app();
     let request = Request::builder()
         .method("GET")
         .uri("/")

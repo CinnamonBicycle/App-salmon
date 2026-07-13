@@ -12,7 +12,9 @@ use app_salmon::adapters::system_clock::SystemClock;
 use app_salmon::adapters::system_users::{self, WorkerResolutionError};
 use app_salmon::backends::ClusterBackend;
 use app_salmon::backends::postgres::PostgresBackend;
+use app_salmon::client_workers::ClientWorkers;
 use app_salmon::config::{Config, ConfigError};
+use app_salmon::domain::ids::ClientId;
 use app_salmon::domain::service_kind::ServiceKind;
 use app_salmon::http::{self, AppState};
 use app_salmon::ports::container_runtime::DockerError;
@@ -21,7 +23,6 @@ use app_salmon::service::cluster_service::{ClusterService, Limits};
 use app_salmon::service::deps::{TaskDeps, TaskRegistry};
 use app_salmon::service::{log_rotation, reconciliation, ttl_reaper};
 use app_salmon::telemetry::{self, TelemetryError};
-use app_salmon::worker_pool::WorkerPool;
 use chrono::TimeDelta;
 use clap::Parser;
 
@@ -54,8 +55,8 @@ enum AppStartupError {
     /// couldn't be created.
     #[error(transparent)]
     Telemetry(#[from] TelemetryError),
-    /// Resolving the configured worker accounts' uid/gid against `/etc/passwd` failed — a
-    /// configured worker account doesn't exist, or the passwd file couldn't be read/parsed.
+    /// Resolving a configured client's Unix account uid/gid against `/etc/passwd` failed — the
+    /// account doesn't exist, or the passwd file couldn't be read/parsed.
     #[error(transparent)]
     WorkerResolution(#[from] WorkerResolutionError),
     /// The `SQLite`-backed cluster repository couldn't be opened.
@@ -110,14 +111,13 @@ async fn ensure_parent_dir(path: &Path) -> Result<(), AppStartupError> {
     Ok(())
 }
 
-/// Builds every real adapter, runs startup reconciliation (must complete before the listener
-/// binds, so `list`/`info` never contradict real backend state right after a restart), and
-/// returns the `TaskDeps` with the worker pool already reflecting reconciliation's findings.
+/// Builds every real adapter, then runs startup reconciliation (must complete before the listener
+/// binds, so `list`/`info` never contradict real backend state right after a restart).
 ///
 /// # Arguments
 ///
-/// - `config`: the loaded, validated application configuration — supplies the worker pool size
-///   and account prefix, the Docker socket path and Postgres image, and the health-check timeout.
+/// - `config`: the loaded, validated application configuration — supplies each client's Unix
+///   account, the Docker socket path and Postgres image, and the health-check timeout.
 /// - `repository`: the shared cluster repository. Passed in (not constructed here) so this
 ///   function and its caller operate on the exact same handle rather than two separate opens of
 ///   the same database file.
@@ -127,28 +127,32 @@ async fn ensure_parent_dir(path: &Path) -> Result<(), AppStartupError> {
 ///
 /// # Returns
 ///
-/// The fully assembled [`TaskDeps`], with `worker_pool` populated from the free-worker list that
-/// startup reconciliation computed — not simply every configured worker, since reconciliation may
-/// find some still referenced by a row that survived the restart.
+/// The fully assembled [`TaskDeps`].
 ///
 /// # Errors
 ///
-/// Returns [`AppStartupError::WorkerResolution`] if resolving the configured worker accounts'
-/// uid/gid against `/etc/passwd` fails, or [`AppStartupError::Docker`] if the Docker daemon socket
-/// can't be connected to. Startup reconciliation itself never fails this function — it logs and
-/// continues past any repository or backend error it encounters internally.
+/// Returns [`AppStartupError::WorkerResolution`] if resolving any configured client's Unix
+/// account uid/gid against `/etc/passwd` fails, or [`AppStartupError::Docker`] if the Docker
+/// daemon socket can't be connected to. Startup reconciliation itself never fails this function —
+/// it logs and continues past any repository or backend error it encounters internally.
 async fn build_task_deps(
     config: &Config,
     repository: Arc<SqliteClusterRepository>,
     clock: Arc<SystemClock>,
     secrets: Arc<RandSecretGenerator>,
 ) -> Result<Arc<TaskDeps>, AppStartupError> {
-    let configured_workers = system_users::resolve_worker_users(
-        Path::new(SYSTEM_PASSWD_PATH),
-        &config.worker_pool.user_prefix,
-        config.worker_pool.size,
-    )
-    .await?;
+    let configured_clients: Vec<(ClientId, String)> = config
+        .clients
+        .iter()
+        .map(|client| (ClientId::new(client.name.clone()), client.unix_user.clone()))
+        .collect();
+    let client_workers =
+        system_users::resolve_client_workers(Path::new(SYSTEM_PASSWD_PATH), &configured_clients)
+            .await?;
+    tracing::info!(
+        clients = client_workers.len(),
+        "resolved configured clients' unix accounts"
+    );
 
     let container_runtime = Arc::new(BollardContainerRuntime::connect(
         &config.docker.socket_path,
@@ -174,30 +178,17 @@ async fn build_task_deps(
 
     let task_deps = Arc::new(TaskDeps {
         repository: repository.clone(),
-        // Placeholder pool, replaced below once reconciliation determines the real free list —
-        // reconciliation itself only needs repository/backends/clock/privileged_exec, not the pool.
-        worker_pool: Arc::new(WorkerPool::new(vec![])),
+        client_workers: Arc::new(ClientWorkers::new(client_workers)),
         privileged_exec,
         backends,
         clock: clock.clone(),
         worker_data_dir_base,
     });
 
-    let free_workers = reconciliation::run(&task_deps, &configured_workers).await;
-    tracing::info!(
-        free = free_workers.len(),
-        total = configured_workers.len(),
-        "startup reconciliation complete"
-    );
+    reconciliation::run(&task_deps).await;
+    tracing::info!("startup reconciliation complete");
 
-    Ok(Arc::new(TaskDeps {
-        repository: task_deps.repository.clone(),
-        worker_pool: Arc::new(WorkerPool::new(free_workers)),
-        privileged_exec: task_deps.privileged_exec.clone(),
-        backends: task_deps.backends.clone(),
-        clock: task_deps.clock.clone(),
-        worker_data_dir_base: task_deps.worker_data_dir_base.clone(),
-    }))
+    Ok(task_deps)
 }
 
 /// Runs the whole service end to end: initializes telemetry, opens the repository, builds every

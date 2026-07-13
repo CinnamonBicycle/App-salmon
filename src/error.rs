@@ -16,10 +16,10 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::auth::AuthError;
+use crate::client_workers::ClientWorkerError;
 use crate::domain::cluster::ClusterError;
 use crate::ports::container_runtime::DockerError;
 use crate::ports::repository::RepositoryError;
-use crate::worker_pool::WorkerPoolError;
 
 /// Every internal (non-auth, non-domain-validation) failure that can reach [`ApiError::Internal`]
 /// — always mapped to a `500`, with only [`InternalError::category`]'s coarse name logged, never
@@ -29,10 +29,9 @@ pub enum InternalError {
     /// A durable-storage failure (`SQLite`, (de)serialization, corrupt row).
     #[error(transparent)]
     Repository(#[from] RepositoryError),
-    /// A worker-pool failure other than plain exhaustion (which maps to
-    /// [`ApiError::Unavailable`] instead — see [`From<ClusterError>`] below).
+    /// A client's Unix account lookup or a directory prepare/wipe operation against it failed.
     #[error(transparent)]
-    WorkerPool(#[from] WorkerPoolError),
+    ClientWorker(#[from] ClientWorkerError),
     /// A Docker/`bollard` failure other than a daemon-unreachable `Connect` error (which maps to
     /// [`ApiError::Unavailable`] instead — see [`From<ClusterError>`] below).
     #[error(transparent)]
@@ -50,11 +49,11 @@ impl InternalError {
     /// # Returns
     ///
     /// A short, static, non-secret label identifying which `InternalError` variant `self` is
-    /// (`"repository"`, `"worker_pool"`, `"docker"`, or `"backend"`), suitable for a log field.
+    /// (`"repository"`, `"client_worker"`, `"docker"`, or `"backend"`), suitable for a log field.
     fn category(&self) -> &'static str {
         match self {
             InternalError::Repository(_) => "repository",
-            InternalError::WorkerPool(_) => "worker_pool",
+            InternalError::ClientWorker(_) => "client_worker",
             InternalError::Docker(_) => "docker",
             InternalError::Backend(_) => "backend",
         }
@@ -103,9 +102,9 @@ impl From<ClusterError> for ApiError {
     /// # Returns
     ///
     /// The corresponding `ApiError`: `BadRequest` for TTL/invalid-transition errors,
-    /// `QuotaExceeded`/`NotFound` passed through directly, `Unavailable` for pool exhaustion or a
-    /// Docker daemon connect failure specifically, and `Internal` (wrapping the appropriate
-    /// [`InternalError`] variant) for everything else.
+    /// `QuotaExceeded`/`NotFound` passed through directly, `Unavailable` for a Docker daemon
+    /// connect failure specifically, and `Internal` (wrapping the appropriate [`InternalError`]
+    /// variant) for everything else.
     fn from(err: ClusterError) -> Self {
         match err {
             ClusterError::TtlOutOfBounds { .. } | ClusterError::InvalidTransition { .. } => {
@@ -113,10 +112,9 @@ impl From<ClusterError> for ApiError {
             }
             ClusterError::QuotaExceeded { .. } => ApiError::QuotaExceeded,
             ClusterError::NotFound(_) => ApiError::NotFound,
-            ClusterError::WorkerPool(WorkerPoolError::PoolExhausted { .. }) => {
-                ApiError::Unavailable("worker pool exhausted".to_string())
+            ClusterError::ClientWorker(other) => {
+                ApiError::Internal(InternalError::ClientWorker(other))
             }
-            ClusterError::WorkerPool(other) => ApiError::Internal(InternalError::WorkerPool(other)),
             ClusterError::Docker(DockerError::Connect { .. }) => {
                 ApiError::Unavailable("docker daemon unreachable".to_string())
             }
@@ -185,10 +183,10 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::{ApiError, InternalError};
     use crate::auth::AuthError;
+    use crate::client_workers::ClientWorkerError;
     use crate::domain::cluster::ClusterError;
     use crate::domain::ids::{ClientId, ClusterId};
     use crate::ports::container_runtime::DockerError;
-    use crate::worker_pool::WorkerPoolError;
     use axum::response::IntoResponse;
     use bollard::errors::Error as BollardError;
 
@@ -248,11 +246,12 @@ mod tests {
 
     #[test]
     fn internal_error_response_never_includes_raw_source_text() {
-        let response =
-            ApiError::Internal(InternalError::WorkerPool(WorkerPoolError::PoolExhausted {
-                pool_size: 3,
-            }))
-            .into_response();
+        let response = ApiError::Internal(InternalError::ClientWorker(
+            ClientWorkerError::UnknownClient {
+                client: ClientId::new("agent"),
+            },
+        ))
+        .into_response();
         assert_eq!(
             response.status(),
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -288,21 +287,14 @@ mod tests {
     }
 
     #[test]
-    fn cluster_error_pool_exhausted_maps_to_unavailable() {
-        let err: ApiError =
-            ClusterError::WorkerPool(WorkerPoolError::PoolExhausted { pool_size: 3 }).into();
-        assert!(matches!(err, ApiError::Unavailable(_)));
-    }
-
-    #[test]
-    fn cluster_error_other_worker_pool_errors_map_to_internal() {
-        let err: ApiError = ClusterError::WorkerPool(WorkerPoolError::DoubleRelease {
-            worker: crate::domain::ids::WorkerUser::new("salmon-worker-00", 2000, 2000),
+    fn cluster_error_client_worker_errors_map_to_internal() {
+        let err: ApiError = ClusterError::ClientWorker(ClientWorkerError::UnknownClient {
+            client: ClientId::new("agent"),
         })
         .into();
         assert!(matches!(
             err,
-            ApiError::Internal(InternalError::WorkerPool(_))
+            ApiError::Internal(InternalError::ClientWorker(_))
         ));
     }
 
@@ -388,7 +380,9 @@ mod tests {
                 InternalError::Repository(crate::ports::repository::RepositoryError::Migration(
                     "boom".to_string(),
                 )),
-                InternalError::WorkerPool(WorkerPoolError::PoolExhausted { pool_size: 1 }),
+                InternalError::ClientWorker(ClientWorkerError::UnknownClient {
+                    client: ClientId::new("agent"),
+                }),
                 InternalError::Docker(DockerError::HealthCheckTimeout {
                     container: crate::ports::container_runtime::ContainerHandle::new("abc123"),
                     waited_secs: 1,

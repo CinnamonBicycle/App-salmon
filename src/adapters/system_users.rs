@@ -1,18 +1,19 @@
-//! Resolves worker account uid/gid from `/etc/passwd`-format text. Needed because Docker's
-//! `--user <uid>:<gid>` can't resolve a host-only account name from inside the container — only
-//! numeric ids work — while `sudo -u <name>` (used elsewhere) works from the name alone. The
-//! worker accounts themselves are provisioned by an admin ahead of time (see `docs/DESIGN.md`);
-//! this just reads back what the OS already knows about them.
+//! Resolves each configured client's Unix account uid/gid from `/etc/passwd`-format text. Needed
+//! because Docker's `--user <uid>:<gid>` can't resolve a host-only account name from inside the
+//! container — only numeric ids work — while `sudo -u <name>` (used elsewhere) works from the name
+//! alone. The accounts themselves are provisioned by an admin ahead of time (see
+//! `docs/DESIGN.md`); this just reads back what the OS already knows about them.
 //!
 //! The path to the passwd file is a parameter (default `/etc/passwd`, overridden in tests) so
 //! this is testable by pointing it at a temp file shaped like `/etc/passwd`, without needing the
-//! real worker accounts to exist on the machine running the tests.
+//! real client accounts to exist on the machine running the tests.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use thiserror::Error;
 
-use crate::domain::ids::WorkerUser;
+use crate::domain::ids::{ClientId, WorkerUser};
 
 #[derive(Debug, Error)]
 pub enum WorkerResolutionError {
@@ -80,32 +81,29 @@ fn parse_uid_gid(contents: &str, name: &str) -> Result<(u32, u32), WorkerResolut
     Ok((uid, gid))
 }
 
-/// Resolves `{user_prefix}00`, `{user_prefix}01`, ... up to `count` accounts, in order.
+/// Resolves each `(ClientId, unix account name)` pair's uid/gid against a passwd file, building
+/// the mapping [`crate::client_workers::ClientWorkers`] is constructed from.
 ///
 /// # Arguments
 ///
 /// - `passwd_path`: path to a `/etc/passwd`-format file to read and parse. `/etc/passwd` in
 ///   production; a temp file shaped like it in tests.
-/// - `user_prefix`: the common prefix shared by every worker account name (e.g.
-///   `"salmon-worker-"`).
-/// - `count`: how many sequentially-numbered accounts to resolve, starting from `00`.
+/// - `clients`: one `(client id, configured unix account name)` pair per `[[clients]]` entry.
 ///
 /// # Returns
 ///
-/// A [`WorkerUser`] for each of the `count` accounts, in order (`00`, `01`, ...), each carrying
-/// the uid/gid resolved from the passwd file.
+/// A [`WorkerUser`] (carrying the resolved uid/gid) per client, keyed by [`ClientId`].
 ///
 /// # Errors
 ///
 /// Returns [`WorkerResolutionError::Read`] if `passwd_path` can't be read, or
 /// [`WorkerResolutionError::AccountNotFound`] / [`WorkerResolutionError::MalformedEntry`] if any
-/// expected account is missing or has an unparseable entry — a misconfigured worker pool fails
-/// loudly at startup rather than silently running with fewer workers than configured.
-pub async fn resolve_worker_users(
+/// configured client's account is missing or has an unparseable entry — a misconfigured client
+/// account fails loudly at startup rather than silently running with a wrong/missing mapping.
+pub async fn resolve_client_workers(
     passwd_path: &Path,
-    user_prefix: &str,
-    count: usize,
-) -> Result<Vec<WorkerUser>, WorkerResolutionError> {
+    clients: &[(ClientId, String)],
+) -> Result<HashMap<ClientId, WorkerUser>, WorkerResolutionError> {
     let contents = tokio::fs::read_to_string(passwd_path)
         .await
         .map_err(|source| WorkerResolutionError::Read {
@@ -113,29 +111,33 @@ pub async fn resolve_worker_users(
             source,
         })?;
 
-    (0..count)
-        .map(|i| {
-            let name = format!("{user_prefix}{i:02}");
-            let (uid, gid) = parse_uid_gid(&contents, &name)?;
-            Ok(WorkerUser::new(name, uid, gid))
+    clients
+        .iter()
+        .map(|(client_id, unix_user)| {
+            let (uid, gid) = parse_uid_gid(&contents, unix_user)?;
+            Ok((
+                client_id.clone(),
+                WorkerUser::new(unix_user.clone(), uid, gid),
+            ))
         })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkerResolutionError, parse_uid_gid, resolve_worker_users};
+    use super::{WorkerResolutionError, parse_uid_gid, resolve_client_workers};
+    use crate::domain::ids::ClientId;
 
     const SAMPLE_PASSWD: &str = "\
 root:x:0:0:root:/root:/bin/bash
-salmon-worker-00:x:2000:2000::/home/salmon-worker-00:/usr/sbin/nologin
-salmon-worker-01:x:2001:2001::/home/salmon-worker-01:/usr/sbin/nologin
+openbrain-agent:x:2000:2000::/home/openbrain-agent:/usr/sbin/nologin
+rainqueue-agent:x:2001:2001::/home/rainqueue-agent:/usr/sbin/nologin
 malformed-entry:x:notanumber:2002::/home/malformed-entry:/usr/sbin/nologin
 ";
 
     #[test]
     fn parses_uid_gid_for_known_account() {
-        let (uid, gid) = parse_uid_gid(SAMPLE_PASSWD, "salmon-worker-00").expect("account present");
+        let (uid, gid) = parse_uid_gid(SAMPLE_PASSWD, "openbrain-agent").expect("account present");
         assert_eq!((uid, gid), (2000, 2000));
     }
 
@@ -152,46 +154,62 @@ malformed-entry:x:notanumber:2002::/home/malformed-entry:/usr/sbin/nologin
     }
 
     #[tokio::test]
-    async fn resolve_worker_users_reads_a_real_file() {
+    async fn resolve_client_workers_reads_a_real_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("passwd");
         tokio::fs::write(&path, SAMPLE_PASSWD)
             .await
             .expect("write fake passwd");
 
-        let workers = resolve_worker_users(&path, "salmon-worker-", 2)
+        let clients = vec![
+            (ClientId::new("openbrain"), "openbrain-agent".to_string()),
+            (ClientId::new("rainqueue"), "rainqueue-agent".to_string()),
+        ];
+        let workers = resolve_client_workers(&path, &clients)
             .await
             .expect("resolves");
         assert_eq!(workers.len(), 2);
-        assert_eq!(workers[0].as_str(), "salmon-worker-00");
-        assert_eq!(workers[0].uid(), 2000);
-        assert_eq!(workers[1].as_str(), "salmon-worker-01");
-        assert_eq!(workers[1].uid(), 2001);
+        let openbrain = &workers[&ClientId::new("openbrain")];
+        assert_eq!(openbrain.as_str(), "openbrain-agent");
+        assert_eq!(openbrain.uid(), 2000);
+        let rainqueue = &workers[&ClientId::new("rainqueue")];
+        assert_eq!(rainqueue.as_str(), "rainqueue-agent");
+        assert_eq!(rainqueue.uid(), 2001);
     }
 
     #[tokio::test]
-    async fn resolve_worker_users_errors_when_pool_exceeds_provisioned_accounts() {
+    async fn resolve_client_workers_errors_when_an_account_is_not_provisioned() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("passwd");
         tokio::fs::write(&path, SAMPLE_PASSWD)
             .await
             .expect("write fake passwd");
 
-        let err = resolve_worker_users(&path, "salmon-worker-", 5)
+        let clients = vec![(ClientId::new("openbrain"), "nonexistent-agent".to_string())];
+        let err = resolve_client_workers(&path, &clients)
             .await
-            .expect_err("only 2 provisioned");
+            .expect_err("account not provisioned");
         assert!(matches!(err, WorkerResolutionError::AccountNotFound { .. }));
     }
 
     #[tokio::test]
-    async fn resolve_worker_users_errors_on_missing_file() {
-        let err = resolve_worker_users(
-            std::path::Path::new("/nonexistent/passwd"),
-            "salmon-worker-",
-            1,
-        )
-        .await
-        .expect_err("missing file");
+    async fn resolve_client_workers_errors_on_missing_file() {
+        let clients = vec![(ClientId::new("openbrain"), "openbrain-agent".to_string())];
+        let err = resolve_client_workers(std::path::Path::new("/nonexistent/passwd"), &clients)
+            .await
+            .expect_err("missing file");
         assert!(matches!(err, WorkerResolutionError::Read { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolve_client_workers_with_no_clients_returns_empty_map() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("passwd");
+        tokio::fs::write(&path, SAMPLE_PASSWD)
+            .await
+            .expect("write fake passwd");
+
+        let workers = resolve_client_workers(&path, &[]).await.expect("resolves");
+        assert!(workers.is_empty());
     }
 }

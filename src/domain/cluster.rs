@@ -14,11 +14,11 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use thiserror::Error;
 
+use crate::client_workers::ClientWorkerError;
 use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
 use crate::domain::service_kind::{ConnectionInfo, ServiceSpec};
 use crate::ports::container_runtime::DockerError;
 use crate::ports::repository::RepositoryError;
-use crate::worker_pool::WorkerPoolError;
 
 /// A single provisioned (or provisioning) cluster row, as persisted by `ports::repository` and
 /// returned to API callers.
@@ -39,10 +39,25 @@ pub struct Cluster {
     pub requested_at: DateTime<Utc>,
     /// Where this cluster currently is in its lifecycle — see [`ClusterState`].
     pub state: ClusterState,
-    /// `Some` from the moment a worker is allocated until it's released back to the pool at the
-    /// end of teardown — outlives the `Spawning` state, since a cluster that fails or is deleted
-    /// mid-spawn still holds its worker until cleanup actually completes.
+    /// `Some` from the moment the owner's account is resolved during spawn — persisted on the row
+    /// (rather than re-derived from `owner` on every use) so teardown can still find and wipe the
+    /// right directory even if the operator's client config changes between a cluster's spawn and
+    /// its teardown. Outlives the `Spawning` state: a cluster that fails or is deleted mid-spawn
+    /// still needs it until cleanup actually completes.
     pub worker: Option<WorkerUser>,
+    /// Which of the owner's `max_clusters_per_user` directory slots (`0..limit`) this cluster's
+    /// on-disk directory uses — see `client_workers::worker_data_dir`. Assigned atomically by
+    /// [`crate::ports::repository::ClusterRepository::try_insert_if_under_quota`] at insert time
+    /// (smallest slot not already used by one of the owner's other active rows), so it's always a
+    /// real, distinct value for any row read back from storage; a value built locally before that
+    /// call (see `service::cluster_service::ClusterService::create`) is a placeholder the
+    /// repository always overwrites, never one a caller should rely on. Fixed, literal per-slot
+    /// paths (rather than one path per cluster id) are what let the sudoers rule enumerate exactly
+    /// `max_clusters_per_user` allowed paths per client instead of needing a wildcard — some
+    /// `sudo` implementations (`sudo-rs`, confirmed via `visudo -c`) reject wildcards embedded in
+    /// command arguments outright, so the path must be one of a small, literal, pre-provisioned
+    /// set.
+    pub slot: u32,
 }
 
 /// Where a [`Cluster`] currently is in its lifecycle. See the module docs for why this is a plain
@@ -167,9 +182,10 @@ pub enum ClusterError {
         /// The event that didn't apply to it.
         event: Box<ClusterEvent>,
     },
-    /// A worker-pool operation failed (exhaustion, or a directory prepare/wipe failure).
+    /// Resolving the owner's Unix account, or a directory prepare/wipe operation against it,
+    /// failed.
     #[error(transparent)]
-    WorkerPool(#[from] WorkerPoolError),
+    ClientWorker(#[from] ClientWorkerError),
     /// A container-runtime (Docker) operation failed.
     #[error(transparent)]
     Docker(#[from] DockerError),

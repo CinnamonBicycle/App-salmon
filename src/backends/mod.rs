@@ -35,6 +35,9 @@ pub trait ClusterBackend: Send + Sync {
     ///   deterministic, recomputable resource name/identity.
     /// - `worker`: the pre-allocated worker account this backend's resources must run/be owned
     ///   as, both for process privilege-drop and for on-disk attribution.
+    /// - `slot`: `cluster_id`'s assigned directory slot (see
+    ///   `crate::domain::cluster::Cluster::slot`) — used, together with `worker`, to compute the
+    ///   on-disk directory bind-mounted into the resource.
     /// - `service`: the caller's requested service configuration (kind plus any kind-specific
     ///   options, e.g. whether to enable `pgvector`).
     ///
@@ -50,6 +53,7 @@ pub trait ClusterBackend: Send + Sync {
         &self,
         cluster_id: &ClusterId,
         worker: &WorkerUser,
+        slot: u32,
         service: &ServiceSpec,
     ) -> Result<ConnectionInfo, ClusterError>;
 

@@ -132,6 +132,7 @@ pub async fn run_forever(
 #[cfg(test)]
 mod tests {
     use super::{run_forever, run_once};
+    use crate::client_workers::ClientWorkers;
     use crate::domain::cluster::{ClusterState, DeleteReason};
     use crate::domain::ids::ClientId;
     use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
@@ -142,7 +143,6 @@ mod tests {
     use crate::test_support::{
         FakeSecretGenerator, InMemoryClusterRepository, NoopPrivilegedExecutor,
     };
-    use crate::worker_pool::WorkerPool;
     use chrono::{TimeDelta, Utc};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -162,7 +162,7 @@ mod tests {
         );
         let deps = Arc::new(TaskDeps {
             repository,
-            worker_pool: Arc::new(WorkerPool::new(vec![])),
+            client_workers: Arc::new(ClientWorkers::new(HashMap::new())),
             privileged_exec: Arc::new(NoopPrivilegedExecutor),
             backends: HashMap::new(),
             clock: clock.clone(),
