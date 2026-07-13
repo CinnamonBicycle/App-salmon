@@ -67,9 +67,13 @@ e2e-vm-up:
 e2e-vm-test:
     ./scripts/vm/e2e-vm-run-tests.sh
 
-# Whether the persistent e2e VM is up (and provisioned/ready for e2e-vm-test).
+# Whether the persistent e2e VM is up (and provisioned/ready for e2e-vm-test). The script itself
+# exits 2 when down (by design — `ci` above relies on that exit code, calling the script
+# directly rather than through this recipe), which would otherwise make `just` print its own
+# "recipe failed" noise on top of the "down" message for a plain status check; swallowed here so
+# this recipe just reports state instead of failing.
 e2e-vm-status:
-    ./scripts/vm/e2e-vm-status.sh
+    ./scripts/vm/e2e-vm-status.sh || true
 
 # Tear down the persistent e2e VM and wipe its disk. Run this when you're done for the session.
 e2e-vm-down:
