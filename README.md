@@ -73,8 +73,10 @@ in every environment. **There are three ways to give it that:**
   the design and, in particular, the SSH transport's security model (loopback-bound port
   forwarding, pubkey-only auth, a host-generated and pinned SSH host key — not
   trust-on-first-use).
-- **`just test-e2e-vm` (recommended for a single run):** the same idea, but boots, tests, and
-  discards the VM every call — simpler if you only need one run.
+- **`just test-e2e-vm`:** the same idea, but boots, tests, and discards the VM every call —
+  simpler if you only need one run. **Currently has a known bug** (`docs/DESIGN.md` §8b): the
+  non-root test step will hit `Permission denied` for the same reason the persistent-VM path
+  originally did. Use `e2e-vm-up`/`e2e-vm-test` above until it's fixed there too.
   Either VM path: this host only ever needs `/dev/kvm` access — `just setup-e2e-vm` gets you
   that with sudo used just once, for installing QEMU and joining the standard `kvm` group, the
   same one-time step any KVM user needs on a fresh machine regardless of this project. Nothing

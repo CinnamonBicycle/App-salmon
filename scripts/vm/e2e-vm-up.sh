@@ -12,13 +12,14 @@
 # Then:  scripts/vm/e2e-vm-run-tests.sh   (repeatedly, as often as you like)
 #        scripts/vm/e2e-vm-down.sh        (when done — wipes the VM's disk)
 #
-# Status: written and reviewed (`bash -n` clean; the qemu flags — including -pidfile/-daemonize
-# and hostfwd — were checked against this machine's `qemu-system-x86_64 --help` output and the
-# exact hostfwd/pidfile/daemonize combination was boot-tested for real under software emulation,
-# confirming the pidfile is written with the correct PID and /proc/<pid>/cmdline round-trips
-# through vm_pid_is_our_qemu's matching logic), but NOT boot-verified end-to-end against a real
-# cloud image in any session so far — see docs/DESIGN.md §8b for exactly what was and wasn't
-# checked, same posture as run-e2e-in-vm.sh.
+# Status: boot-verified for real against a real KVM host (2026-07-13) — boot, cloud-init's
+# write_files/ssh_authorized_keys/host-key injection, and SSH all confirmed working. That first
+# real run also found a real bug: a live 9p share (security_model=none) passes the host's raw
+# uid/gid/mode through to the guest, so a non-root guest user without a matching uid gets locked
+# out of a normal-permission host checkout. Fixed by dropping the 9p share entirely in favor of
+# copying the repo in over the same SSH channel (see lib.sh's vm_sync_repo) — not yet re-verified
+# against real KVM since that fix (the qemu flags/cloud-init schema themselves are otherwise
+# unchanged from the verified boot). See docs/DESIGN.md §8c.
 
 set -euo pipefail
 
@@ -34,6 +35,8 @@ STATE_DIR="$(vm_state_dir)"
 # re-running this script, not silently no-op'd.
 provision_and_mark() {
 	local port="$1"
+	echo "== syncing repo =="
+	vm_sync_repo "$STATE_DIR" "$port"
 	echo "== provisioning (docker, rust, e2e accounts) =="
 	if vm_ssh "$STATE_DIR" "$port" "sudo bash /repo/scripts/vm/guest-provision.sh"; then
 		touch "$STATE_DIR/provisioned"
@@ -109,8 +112,6 @@ write_files:
     owner: root:root
     content: ${HOST_KEY_PUB_B64}
 runcmd:
-  - [mkdir, -p, /repo]
-  - [mount, -t, 9p, -o, "trans=virtio,version=9p2000.L,msize=524288", repo, /repo]
   - [systemctl, restart, ssh]
 EOF
 cat >"$STATE_DIR/meta-data" <<EOF
@@ -132,7 +133,6 @@ qemu-system-x86_64 \
 	-drive file="$STATE_DIR/overlay.qcow2",if=virtio,format=qcow2 \
 	-drive file="$STATE_DIR/seed.iso",if=virtio,format=raw,media=cdrom,readonly=on \
 	-netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${PORT}-:22" -device virtio-net-pci,netdev=net0 \
-	-virtfs local,path="$REPO_ROOT",mount_tag=repo,security_model=none,id=repo0 \
 	-name "guest=app-salmon-e2e-persistent" \
 	-pidfile "$STATE_DIR/qemu.pid" \
 	-daemonize

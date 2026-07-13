@@ -401,9 +401,21 @@ the e2e suite — including a disposable CI runner or a developer's own laptop �
 and the earlier design left no way to run the e2e suite *without* accepting it. `just
 test-e2e-vm` (→ `scripts/vm/run-e2e-in-vm.sh`) closes that gap: it runs the entire e2e suite,
 including `setup-e2e-env.sh` itself, inside an ephemeral QEMU VM booted from a stock Ubuntu cloud
-image, and discards the VM's disk when the run finishes. **This is now the recommended way to run
-the e2e suite.** The invoking host only ever needs QEMU + `/dev/kvm` access — never runs
-`useradd`, never writes to its own `/etc/sudoers.d`, and never needs a Docker daemon of its own.
+image, and discards the VM's disk when the run finishes. The invoking host only ever needs QEMU +
+`/dev/kvm` access — never runs `useradd`, never writes to its own `/etc/sudoers.d`, and never
+needs a Docker daemon of its own.
+
+**Known, unfixed bug, found via §8c — do not treat this path as verified until it's fixed here
+too.** `run-e2e-in-vm.sh`/`guest-init.sh` use the same `-virtfs local,...,security_model=none` 9p
+share and the same `su - ubuntu -c "cd $REPO && ..."` pattern that §8c's first real KVM run
+found broken: `security_model=none` passes the host's raw uid/gid/mode through to the guest, so a
+non-root guest user without a numerically matching uid gets `Permission denied` on the shared
+`/repo` — root bypasses the check (which is why the `setup-e2e-env.sh` step, run via `sudo`,
+would still work), but the actual `cargo test --test e2e` step, run as plain `ubuntu`, would not.
+This has not yet been fixed here the way §8c was (copying the repo in over a channel instead of a
+live share) because this path has no SSH/synchronous channel to reuse — it's a fire-and-forget
+cloud-init script with no interactive session, so the same fix would need a different mechanism.
+Prefer `just e2e-vm-up`/`e2e-vm-test` (§8c) until this is addressed.
 
 **Getting to "QEMU + `/dev/kvm` access" — `just setup-e2e-vm` (→ `scripts/vm/setup-vm-host.sh`):**
 this is the *only* place sudo is needed anywhere in the VM e2e path, and it's a one-time,
@@ -520,15 +532,38 @@ neither the persistent VM nor the bare-host setup is available, `ci` prints all 
   (asks the OS for a free `127.0.0.1` port via a throwaway Python socket bind — a small, accepted
   TOCTOU race for a local single-user dev tool), `vm_pid_is_our_qemu` (checks `/proc/<pid>/cmdline`
   contains both `qemu-system-x86_64` and a marker — the overlay disk's path — so a stale pidfile
-  whose PID has been reused by an unrelated process can't be mistaken for our VM), and `vm_ssh`
-  (see security model below).
+  whose PID has been reused by an unrelated process can't be mistaken for our VM), `vm_sync_repo`
+  (see "getting the repo into the guest" below), and `vm_ssh` (see security model below).
 - `scripts/vm/e2e-vm-up.sh`: idempotent (does nothing if a healthy instance is already up),
   reaps a stale state dir (dead or mismatched-identity pidfile) if one's left over from a crash,
   generates a fresh ed25519 host keypair and client keypair, picks a free port, boots with
   `-netdev user,id=net0,hostfwd=tcp:127.0.0.1:<port>-:22` (see security model — the `127.0.0.1`
   is load-bearing, not decorative) plus `-name guest=app-salmon-e2e-persistent -pidfile
   <state>/qemu.pid -daemonize` so it backgrounds itself and leaves a real PID for later checks,
-  waits for SSH, then runs `guest-provision.sh` over SSH and marks the instance `provisioned`.
+  waits for SSH, then syncs the repo in and runs `guest-provision.sh` over SSH and marks the
+  instance `provisioned`.
+- **Getting the repo into the guest — `vm_sync_repo`, not a live share.** The first version of
+  this script exported the checkout via `-virtfs local,...,security_model=none`, the same
+  mechanism §8b uses. **The first real KVM run of this tooling (2026-07-13) found that this is
+  broken for any host checkout with normal-or-tighter permissions**: `security_model=none`
+  passes the host's raw uid/gid/mode straight through to the guest, so `ls -ld` on the mounted
+  share showed the guest reporting the exact host owner (uid/gid `UNKNOWN` inside the guest, no
+  matching `/etc/passwd` entry) and mode. Root always bypasses that check (which is why
+  provisioning — root, via `sudo` — worked in that first run), but the non-root `ubuntu` user hit
+  `Permission denied` on a bare `cd /repo` the moment it tried to run the suite as itself. Fixed
+  by dropping `-virtfs` entirely: `vm_sync_repo` instead `tar`s the checkout (excluding `.git`,
+  `target/`, and this tooling's own `.e2e-vm-state/`/`.e2e-vm-result/` — the exclusion of
+  `.e2e-vm-state` matters specifically because that's where the SSH private keys live, so the
+  guest never receives its own keys) and pipes it over the same SSH channel used for everything
+  else, replacing `/repo` (owned by `ubuntu`) on every call. Two things this bought beyond just
+  fixing the bug: one fewer untested subsystem (the guest kernel's 9p module / virtio-9p
+  transport no longer need to work at all), and a *stronger* isolation property than the live
+  mount had — the guest can no longer write back into the real host checkout under any
+  circumstance, not just "isn't expected to." The cost is a sync step before every provision/test
+  run rather than zero-latency live edits, but for a project this size that's a sub-second-to-low-
+  single-digit-second `tar | ssh | tar`, not a meaningfully different iteration speed — and
+  because it runs on every call (not just once at `e2e-vm-up`), "always tests current code" still
+  holds.
 - `scripts/vm/guest-provision.sh`: the apt/rustup/`setup-e2e-env.sh` portion of the old
   `guest-init.sh`, factored out and made the *only* copy of that logic — both `e2e-vm-up.sh` (once,
   after first boot) and `e2e-vm-run-tests.sh` (every call) run it, and because every step in it
@@ -538,16 +573,19 @@ neither the persistent VM nor the bare-host setup is available, `ci` prints all 
   anywhere — v0.2.0 adding a new apt package or a new `setup-e2e-env.sh` step is picked up
   automatically by the next `just e2e-vm-test` or `just ci`.
 - `scripts/vm/e2e-vm-run-tests.sh` / `e2e-vm-status.sh` / `e2e-vm-down.sh`: thin wrappers around
-  `lib.sh`'s `vm_persistent_is_up`/`vm_persistent_is_provisioned`/`vm_reap_stale`. `down` tries a
-  graceful `sudo poweroff` over SSH first, falls back to `SIGTERM`/`SIGKILL` on the qemu process,
-  then always wipes the whole state directory (overlay disk, keys, logs) — the persistence
-  boundary this session settled on is "within a session," not across `down`/`up` cycles, matching
-  the rest of this tooling's ephemeral-by-default philosophy.
+  `lib.sh`'s `vm_persistent_is_up`/`vm_persistent_is_provisioned`/`vm_reap_stale`.
+  `e2e-vm-run-tests.sh` re-syncs the repo and re-runs `guest-provision.sh` before every test run,
+  same reasoning as `e2e-vm-up.sh`. `down` tries a graceful `sudo poweroff` over SSH first, falls
+  back to `SIGTERM`/`SIGKILL` on the qemu process, then always wipes the whole state directory
+  (overlay disk, keys, logs) — the persistence boundary this session settled on is "within a
+  session," not across `down`/`up` cycles, matching the rest of this tooling's ephemeral-by-
+  default philosophy.
 - **State directory:** `<repo>/.e2e-vm-state/` (gitignored, `0700`) — scoping it under the
   checkout itself, rather than e.g. a hash under `/tmp`, is what makes "one persistent VM per
   checkout" true with no extra bookkeeping: two clones naturally get two state dirs and two VMs.
   Contains the overlay disk, seed ISO, both SSH keypairs, a pinned `known_hosts`, the console
-  log, qemu's pidfile, and a `provisioned` marker.
+  log, qemu's pidfile, and a `provisioned` marker. Deliberately excluded from what gets synced
+  into the guest (see above) — the guest has no reason to ever see its own host-side key material.
 
 **Security model for the SSH transport (this is new attack surface `test-e2e-vm` doesn't have,
 since that path never listens for inbound connections):**
@@ -570,21 +608,34 @@ since that path never listens for inbound connections):**
   and doubles as what makes `vm_persistent_is_up`'s SSH probe a *reliable* health check — a
   probe against `StrictHostKeyChecking=no` could be fooled by some other process holding the
   port; a pinned-host-key probe can't.
-- **9p share exposure is unchanged from §8b** and longer-lived now: the guest (root,
-  `security_model=none`) can write anywhere under the host's checkout for as long as the VM is
-  up. Same trust model as before (trusted test code, not the future untrusted-edge-function
-  workload) — `CARGO_TARGET_DIR=/tmp/target` keeps build output off the share either way.
+- **No 9p share at all**, as of the fix described above — the guest can never write back into
+  the real host checkout under any circumstance (not even root inside the guest can reach it;
+  there's no channel to). The only thing that crosses the SSH boundary is what `vm_sync_repo`
+  explicitly tars up and whatever test output/exit codes come back.
 
-**Verification status:** unlike most of §8b, the SSH security model here **was verified for
-real** in this sandbox, without needing KVM — a real local `sshd` stood in for the guest's sshd
-(same host key, same `AuthorizedKeysFile` pointed at the generated client key, same
-`PasswordAuthentication no`), and `vm_ssh`'s exact option set was run against it:
-- A connection with the correct pinned host key and correct client key succeeds.
-- A connection with the *wrong* pinned host key in `known_hosts` is rejected outright by SSH's
-  own host-key-changed warning (`Host key verification failed`) — confirming the pinning is
-  load-bearing, not merely present.
-- A connection with the wrong client key is rejected with `Permission denied (publickey)` and no
-  password fallback — confirming pubkey-only auth is actually enforced, not just configured.
+**Verification status:**
+- **Boot-verified for real against a real KVM host (2026-07-13):** VM boot, cloud-init's
+  `write_files`/`ssh_authorized_keys`/host-key injection, and SSH all confirmed working exactly
+  as designed — this was the piece flagged as least certain (untested cloud-init module
+  ordering), and it worked on the first real run. That same run also surfaced the 9p-permission
+  bug described above, found and fixed the same session — not yet re-verified against real KVM
+  since that fix, though the qemu flags and cloud-init schema that *were* verified are otherwise
+  unchanged by it.
+- **The SSH security model was independently verified for real in this sandbox, without needing
+  KVM** — a real local `sshd` stood in for the guest's sshd (same host key, same
+  `AuthorizedKeysFile` pointed at the generated client key, same `PasswordAuthentication no`),
+  and `vm_ssh`'s exact option set was run against it:
+  - A connection with the correct pinned host key and correct client key succeeds.
+  - A connection with the *wrong* pinned host key in `known_hosts` is rejected outright by SSH's
+    own host-key-changed warning (`Host key verification failed`) — confirming the pinning is
+    load-bearing, not merely present.
+  - A connection with the wrong client key is rejected with `Permission denied (publickey)` and
+    no password fallback — confirming pubkey-only auth is actually enforced, not just configured.
+- **`vm_sync_repo`'s tar-over-SSH mechanics were also verified for real** against that same
+  stand-in `sshd`: a fake checkout containing `.git/`, `target/`, and `.e2e-vm-state/` (with a
+  fake key file inside it) was synced end-to-end, and the result confirmed to contain the real
+  source files byte-identical to the original, with all three exclusions actually excluded — in
+  particular, confirming the guest never receives `.e2e-vm-state`'s key material.
 - `vm_pid_is_our_qemu` was exercised against a real (tcg-accelerated) `qemu-system-x86_64`
   process booted with the exact `-name`/`-pidfile`/`-daemonize` flags this script uses, including
   its two negative cases (wrong marker, dead PID) — all three branches behave as designed.
@@ -593,11 +644,12 @@ real** in this sandbox, without needing KVM — a real local `sshd` stood in for
 - `qemu-img create -F qcow2` and the `-daemonize`/`-pidfile` combination were both exercised for
   real (the latter confirmed to write the correct PID before the launching shell command returns).
 
-What is still **not** verified, for the same KVM/root reasons as §8b: whether the guest actually
-boots and reaches cloud-init's `write_files`/`runcmd` stage for real, whether `guest-provision.sh`
-succeeds inside the real cloud image, and end-to-end `e2e-vm-up.sh` → `e2e-vm-test` → `e2e-vm-down.sh`
-against a real KVM host. Same next step as §8b: the first session with real `/dev/kvm` access
-should run the full cycle against a scratch checkout.
+What is still **not** verified: `guest-provision.sh` succeeding inside the real cloud image, and
+end-to-end `e2e-vm-up.sh` → `e2e-vm-test` → `e2e-vm-down.sh` against real KVM *since* the
+9p-to-tar fix (boot/cloud-init/SSH were verified before that fix; the fix itself hasn't yet had a
+real KVM run to confirm `vm_sync_repo` and the rest of the pipeline behave against the real guest
+the same way they did against the sandbox stand-in). Next step: re-run the full cycle against a
+scratch checkout and confirm the fix actually resolves the originally-reported `Permission denied`.
 
 ## 9. Testing & coverage
 

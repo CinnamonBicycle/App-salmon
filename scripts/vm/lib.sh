@@ -168,6 +168,40 @@ vm_reap_stale() {
 	rm -rf "$state_dir"
 }
 
+# Replaces whatever's at /repo in the guest with a fresh copy of this checkout's working tree,
+# via tar piped over the same SSH channel used for everything else — not a live 9p/virtfs share.
+#
+# Found on the first real KVM run of this tooling: a 9p share with security_model=none passes
+# the *host's raw uid/gid/mode* straight through to the guest. A host checkout with normal
+# (or, as in the case that surfaced this, deliberately restrictive e.g. 0700) permissions is
+# then invisible to any guest user whose uid doesn't happen to numerically match the host
+# owner's — root always bypasses the check, which is why provisioning (root, via sudo) worked
+# while `ubuntu` got "Permission denied" on a bare `cd /repo`. Copying sidesteps the whole
+# uid-passthrough question rather than working around it, and — since ssh is already the
+# transport for everything else here — lets the qemu invocation drop `-virtfs` entirely, one
+# fewer untested subsystem (the guest kernel's 9p module, virtio-9p transport).
+#
+# Assumes REPO_ROOT is set in the caller's scope (every script here sets it before sourcing this
+# file). Excludes .git (not needed to build/test) and this tooling's own runtime directories.
+# Called before every provisioning/test run, not just once at boot, so "always tests current
+# code" still holds despite not being a live mount — the cost is a sub-second-to-low-single-digit
+# tar-over-ssh for a project this size, not a meaningfully different iteration speed.
+#
+# Refuses to run if /repo is a mountpoint in the guest: a VM booted before this function existed
+# has /repo as a live 9p passthrough mount of $REPO_ROOT, and `rm -rf` does not stop at mount
+# boundaries — run against that, it recurses straight through into the real host checkout
+# (deleting it, including .git; the qemu process runs as the repo-owning host user, so those
+# deletes succeed). If you hit this, `e2e-vm-down` then `e2e-vm-up` to get a VM booted the
+# current way (no 9p mount at all) before syncing again.
+vm_sync_repo() {
+	local state_dir="$1" port="$2"
+	vm_ssh "$state_dir" "$port" \
+		"if mountpoint -q /repo; then echo 'refusing to sync: /repo is a mount in this guest (booted before the 9p-to-copy fix) — run e2e-vm-down then e2e-vm-up first' >&2; exit 1; fi; sudo rm -rf /repo && sudo mkdir -p /repo && sudo chown ubuntu:ubuntu /repo"
+	tar -C "$REPO_ROOT" -czf - \
+		--exclude=.git --exclude=target --exclude=.e2e-vm-state --exclude=.e2e-vm-result \
+		. | vm_ssh "$state_dir" "$port" "tar xzf - -C /repo"
+}
+
 # ssh/scp invoked against a specific persistent-VM instance's pinned host key and client key.
 # Usage: vm_ssh "$STATE_DIR" "$PORT" [ssh args...]
 # Every call site is non-interactive (health probes, provisioning, running tests, poweroff) —
