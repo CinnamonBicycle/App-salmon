@@ -484,13 +484,15 @@ mod tests {
 
         // Simulate spawn_task having completed successfully before the delete arrives.
         let ready_at = clock.now();
-        let connection = crate::domain::service_kind::ConnectionInfo {
-            host: "127.0.0.1".to_string(),
-            port: 5432,
-            dbname: "app_salmon".to_string(),
-            user: "app_salmon".to_string(),
-            password: crate::redacted::Redacted::new("hunter2".to_string()),
-        };
+        let connection = crate::domain::service_kind::ConnectionInfo::Postgres(
+            crate::domain::service_kind::PostgresConnectionInfo {
+                host: "127.0.0.1".to_string(),
+                port: 5432,
+                dbname: "app_salmon".to_string(),
+                user: "app_salmon".to_string(),
+                password: crate::redacted::Redacted::new("hunter2".to_string()),
+            },
+        );
         service
             .repository
             .update_state(

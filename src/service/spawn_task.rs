@@ -208,7 +208,9 @@ mod tests {
     use crate::client_workers::{ClientWorkerError, ClientWorkers};
     use crate::domain::cluster::{Cluster, ClusterError, ClusterState, DeleteReason};
     use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
-    use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
+    use crate::domain::service_kind::{
+        ConnectionInfo, PostgresConnectionInfo, ServiceKind, ServiceSpec,
+    };
     use crate::ports::clock::FakeClock;
     use crate::ports::container_runtime::{ContainerHandle, DockerError};
     use crate::ports::privileged_exec::{
@@ -256,13 +258,13 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             if self.succeed {
-                Ok(ConnectionInfo {
+                Ok(ConnectionInfo::Postgres(PostgresConnectionInfo {
                     host: "127.0.0.1".to_string(),
                     port: 55432,
                     dbname: "app_salmon".to_string(),
                     user: "app_salmon".to_string(),
                     password: Redacted::new("hunter2".to_string()),
-                })
+                }))
             } else {
                 Err(ClusterError::BackendSpawnFailed(
                     "simulated failure".to_string(),
@@ -749,13 +751,13 @@ mod tests {
                 &ClusterState::Ready {
                     ready_at,
                     decommission_at: ready_at + TimeDelta::seconds(300),
-                    connection: ConnectionInfo {
+                    connection: ConnectionInfo::Postgres(PostgresConnectionInfo {
                         host: "127.0.0.1".to_string(),
                         port: 55432,
                         dbname: "app_salmon".to_string(),
                         user: "app_salmon".to_string(),
                         password: Redacted::new("already-ready-secret".to_string()),
-                    },
+                    }),
                 },
             )
             .await
@@ -770,6 +772,9 @@ mod tests {
             .expect("row present");
         match stored.state {
             ClusterState::Ready { connection, .. } => {
+                let ConnectionInfo::Postgres(connection) = connection else {
+                    panic!("expected Postgres connection info");
+                };
                 assert_eq!(
                     connection.password.expose(),
                     "already-ready-secret",
@@ -801,13 +806,13 @@ mod tests {
                 &ClusterState::Ready {
                     ready_at,
                     decommission_at: ready_at + TimeDelta::seconds(300),
-                    connection: ConnectionInfo {
+                    connection: ConnectionInfo::Postgres(PostgresConnectionInfo {
                         host: "127.0.0.1".to_string(),
                         port: 55432,
                         dbname: "app_salmon".to_string(),
                         user: "app_salmon".to_string(),
                         password: Redacted::new("already-ready-secret".to_string()),
-                    },
+                    }),
                 },
             )
             .await

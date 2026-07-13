@@ -23,17 +23,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::cluster::{Cluster, ClusterState, DeleteReason};
 use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
-use crate::domain::service_kind::{ConnectionInfo, ServiceSpec};
+use crate::domain::service_kind::{
+    ConnectionInfo, PostgresConnectionInfo, ServiceSpec, SupabaseConnectionInfo,
+};
 use crate::ports::repository::{ClusterRepository, InsertOutcome, RepositoryError};
 use crate::redacted::Redacted;
 
-/// JSON mirror of [`ConnectionInfo`] for on-disk storage. Exists as a separate type (rather than
-/// deriving `Serialize`/`Deserialize` on `ConnectionInfo` itself) because `password` there is
-/// `Redacted<String>`, which deliberately has no `Serialize` impl — persisting the plaintext
-/// password is a conscious, narrow exception made explicit via `.expose()` in the `From` impls
-/// below, not something every caller of `ConnectionInfo` should be able to do by accident.
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedConnection {
+/// JSON mirror of [`PostgresConnectionInfo`] for on-disk storage — used standalone for
+/// `ServiceKind::Postgres` clusters and nested inside [`PersistedConnection::Supabase`] for
+/// `ServiceKind::Supabase` ones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedPostgresConnection {
     /// Host to connect to — currently always `127.0.0.1`, since containers are only ever
     /// published to the loopback interface.
     host: String,
@@ -44,13 +44,13 @@ struct PersistedConnection {
     /// Database role to connect as.
     user: String,
     /// The plaintext database password. Stored durably as a deliberate exception to
-    /// `Redacted<T>`'s no-`Serialize` rule — see the type-level doc comment above.
+    /// `Redacted<T>`'s no-`Serialize` rule — see [`PersistedConnection`]'s doc comment.
     password: String,
 }
 
-impl From<&ConnectionInfo> for PersistedConnection {
-    /// Converts a live [`ConnectionInfo`] into its persistable form, unwrapping the redacted
-    /// password so it can be serialized to disk.
+impl From<&PostgresConnectionInfo> for PersistedPostgresConnection {
+    /// Converts a live [`PostgresConnectionInfo`] into its persistable form, unwrapping the
+    /// redacted password so it can be serialized to disk.
     ///
     /// # Arguments
     ///
@@ -58,9 +58,9 @@ impl From<&ConnectionInfo> for PersistedConnection {
     ///
     /// # Returns
     ///
-    /// A [`PersistedConnection`] holding a clone of every field, with the password exposed as
-    /// plaintext.
-    fn from(connection: &ConnectionInfo) -> Self {
+    /// A [`PersistedPostgresConnection`] holding a clone of every field, with the password
+    /// exposed as plaintext.
+    fn from(connection: &PostgresConnectionInfo) -> Self {
         Self {
             host: connection.host.clone(),
             port: connection.port,
@@ -71,9 +71,10 @@ impl From<&ConnectionInfo> for PersistedConnection {
     }
 }
 
-impl From<PersistedConnection> for ConnectionInfo {
-    /// Converts a row read back from storage into the live [`ConnectionInfo`] type, re-wrapping
-    /// the plaintext password in [`Redacted`] so it goes back to being leak-resistant in memory.
+impl From<PersistedPostgresConnection> for PostgresConnectionInfo {
+    /// Converts a row read back from storage into the live [`PostgresConnectionInfo`] type,
+    /// re-wrapping the plaintext password in [`Redacted`] so it goes back to being
+    /// leak-resistant in memory.
     ///
     /// # Arguments
     ///
@@ -81,14 +82,128 @@ impl From<PersistedConnection> for ConnectionInfo {
     ///
     /// # Returns
     ///
-    /// The equivalent [`ConnectionInfo`], with `password` wrapped in `Redacted::new`.
-    fn from(persisted: PersistedConnection) -> Self {
+    /// The equivalent [`PostgresConnectionInfo`], with `password` wrapped in `Redacted::new`.
+    fn from(persisted: PersistedPostgresConnection) -> Self {
         Self {
             host: persisted.host,
             port: persisted.port,
             dbname: persisted.dbname,
             user: persisted.user,
             password: Redacted::new(persisted.password),
+        }
+    }
+}
+
+/// JSON mirror of [`ConnectionInfo`] for on-disk storage, tagged by `kind` so each variant only
+/// carries the fields that make sense for it — same rationale as [`PersistedState`]. Exists as a
+/// separate type (rather than deriving `Serialize`/`Deserialize` on `ConnectionInfo` itself)
+/// because every `Redacted<String>` field there deliberately has no `Serialize` impl — persisting
+/// plaintext secrets is a conscious, narrow exception made explicit via `.expose()` in the `From`
+/// impls below, not something every caller of `ConnectionInfo` should be able to do by accident.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PersistedConnection {
+    /// Mirrors [`ConnectionInfo::Postgres`].
+    Postgres {
+        /// Host to connect to.
+        host: String,
+        /// Port to connect to.
+        port: u16,
+        /// Database name.
+        dbname: String,
+        /// Database role.
+        user: String,
+        /// The plaintext database password.
+        password: String,
+    },
+    /// Mirrors [`ConnectionInfo::Supabase`].
+    Supabase {
+        /// Kong's published `host:port`.
+        api_url: String,
+        /// The underlying Postgres instance's connection details.
+        postgres: PersistedPostgresConnection,
+        /// The plaintext `anon`-role JWT.
+        anon_key: String,
+        /// The plaintext `service_role`-role JWT.
+        service_role_key: String,
+        /// The plaintext secret `anon_key`/`service_role_key` are signed with.
+        jwt_secret: String,
+    },
+}
+
+impl From<&ConnectionInfo> for PersistedConnection {
+    /// Converts a live [`ConnectionInfo`] into its persistable, JSON-taggable form, unwrapping
+    /// every redacted secret so it can be serialized to disk.
+    ///
+    /// # Arguments
+    ///
+    /// - `connection`: the connection info to snapshot for storage.
+    ///
+    /// # Returns
+    ///
+    /// The matching [`PersistedConnection`] variant, with every secret exposed as plaintext.
+    fn from(connection: &ConnectionInfo) -> Self {
+        match connection {
+            ConnectionInfo::Postgres(postgres) => {
+                let persisted = PersistedPostgresConnection::from(postgres);
+                PersistedConnection::Postgres {
+                    host: persisted.host,
+                    port: persisted.port,
+                    dbname: persisted.dbname,
+                    user: persisted.user,
+                    password: persisted.password,
+                }
+            }
+            ConnectionInfo::Supabase(supabase) => PersistedConnection::Supabase {
+                api_url: supabase.api_url.clone(),
+                postgres: PersistedPostgresConnection::from(&supabase.postgres),
+                anon_key: supabase.anon_key.expose().clone(),
+                service_role_key: supabase.service_role_key.expose().clone(),
+                jwt_secret: supabase.jwt_secret.expose().clone(),
+            },
+        }
+    }
+}
+
+impl From<PersistedConnection> for ConnectionInfo {
+    /// Converts a row read back from storage into the live [`ConnectionInfo`] type, re-wrapping
+    /// every plaintext secret in [`Redacted`] so it goes back to being leak-resistant in memory.
+    ///
+    /// # Arguments
+    ///
+    /// - `persisted`: the persisted form read back from the database.
+    ///
+    /// # Returns
+    ///
+    /// The matching [`ConnectionInfo`] variant, with every secret wrapped in `Redacted::new`.
+    fn from(persisted: PersistedConnection) -> Self {
+        match persisted {
+            PersistedConnection::Postgres {
+                host,
+                port,
+                dbname,
+                user,
+                password,
+            } => ConnectionInfo::Postgres(PostgresConnectionInfo {
+                host,
+                port,
+                dbname,
+                user,
+                password: Redacted::new(password),
+            }),
+            PersistedConnection::Supabase {
+                api_url,
+                postgres,
+                anon_key,
+                service_role_key,
+                jwt_secret,
+            } => ConnectionInfo::Supabase(SupabaseConnectionInfo {
+                api_url,
+                postgres: postgres.into(),
+                anon_key: Redacted::new(anon_key),
+                service_role_key: Redacted::new(service_role_key),
+                jwt_secret: Redacted::new(jwt_secret),
+            }),
         }
     }
 }
@@ -823,7 +938,9 @@ mod tests {
     use super::SqliteClusterRepository;
     use crate::domain::cluster::{Cluster, ClusterState};
     use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
-    use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
+    use crate::domain::service_kind::{
+        ConnectionInfo, PostgresConnectionInfo, ServiceKind, ServiceSpec, SupabaseConnectionInfo,
+    };
     use crate::ports::repository::{ClusterRepository, InsertOutcome, RepositoryError};
     use crate::redacted::Redacted;
     use chrono::{TimeDelta, Utc};
@@ -847,13 +964,13 @@ mod tests {
     }
 
     fn ready_connection() -> ConnectionInfo {
-        ConnectionInfo {
+        ConnectionInfo::Postgres(PostgresConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: 55432,
             dbname: "app_salmon".to_string(),
             user: "app_salmon".to_string(),
             password: Redacted::new("s3cret-password".to_string()),
-        }
+        })
     }
 
     #[tokio::test]
@@ -1110,11 +1227,67 @@ mod tests {
                 connection: fetched_connection,
                 ..
             } => {
-                assert_eq!(
-                    fetched_connection.password.expose(),
-                    connection.password.expose()
-                );
-                assert_eq!(fetched_connection.port, connection.port);
+                let (ConnectionInfo::Postgres(fetched), ConnectionInfo::Postgres(original)) =
+                    (fetched_connection, connection)
+                else {
+                    panic!("expected Postgres connection info");
+                };
+                assert_eq!(fetched.password.expose(), original.password.expose());
+                assert_eq!(fetched.port, original.port);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_state_round_trips_supabase_connection_info() {
+        let repo = SqliteClusterRepository::open_in_memory()
+            .await
+            .expect("open");
+        let cluster = sample_cluster("agent-a");
+        repo.try_insert_if_under_quota(&cluster, 5)
+            .await
+            .expect("insert");
+
+        let connection = ConnectionInfo::Supabase(SupabaseConnectionInfo {
+            api_url: "http://127.0.0.1:8000".to_string(),
+            postgres: match ready_connection() {
+                ConnectionInfo::Postgres(pg) => pg,
+                ConnectionInfo::Supabase(_) => unreachable!("ready_connection is Postgres"),
+            },
+            anon_key: Redacted::new("anon.jwt".to_string()),
+            service_role_key: Redacted::new("service.jwt".to_string()),
+            jwt_secret: Redacted::new("jwt-secret-value".to_string()),
+        });
+        repo.update_state(
+            &cluster.id,
+            &ClusterState::Ready {
+                ready_at: Utc::now(),
+                decommission_at: Utc::now() + TimeDelta::seconds(300),
+                connection: connection.clone(),
+            },
+        )
+        .await
+        .expect("update state");
+
+        let updated = repo
+            .get_any(&cluster.id)
+            .await
+            .expect("query")
+            .expect("row present");
+        match updated.state {
+            ClusterState::Ready {
+                connection: fetched,
+                ..
+            } => {
+                let ConnectionInfo::Supabase(fetched) = fetched else {
+                    panic!("expected Supabase connection info, got {fetched:?}");
+                };
+                assert_eq!(fetched.api_url, "http://127.0.0.1:8000");
+                assert_eq!(fetched.postgres.port, 55432);
+                assert_eq!(fetched.anon_key.expose(), "anon.jwt");
+                assert_eq!(fetched.service_role_key.expose(), "service.jwt");
+                assert_eq!(fetched.jwt_secret.expose(), "jwt-secret-value");
             }
             other => panic!("expected Ready, got {other:?}"),
         }

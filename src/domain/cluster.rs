@@ -274,18 +274,18 @@ pub fn transition(
 #[cfg(test)]
 mod tests {
     use super::{ClusterError, ClusterEvent, ClusterState, DeleteReason, transition};
-    use crate::domain::service_kind::ConnectionInfo;
+    use crate::domain::service_kind::{ConnectionInfo, PostgresConnectionInfo};
     use crate::redacted::Redacted;
     use chrono::Utc;
 
     fn sample_connection() -> ConnectionInfo {
-        ConnectionInfo {
+        ConnectionInfo::Postgres(PostgresConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: 5432,
             dbname: "app".to_string(),
             user: "app".to_string(),
             password: Redacted::new("hunter2".to_string()),
-        }
+        })
     }
 
     fn spawning() -> ClusterState {

@@ -101,7 +101,9 @@ mod tests {
     use crate::client_workers::ClientWorkers;
     use crate::domain::cluster::{Cluster, ClusterError, ClusterState, DeleteReason};
     use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
-    use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
+    use crate::domain::service_kind::{
+        ConnectionInfo, PostgresConnectionInfo, ServiceKind, ServiceSpec,
+    };
     use crate::ports::clock::FakeClock;
     use crate::ports::repository::{ClusterRepository, InsertOutcome, RepositoryError};
     use crate::redacted::Redacted;
@@ -205,13 +207,13 @@ mod tests {
     #[tokio::test]
     async fn ready_cluster_with_live_backend_is_left_alone() {
         let (deps, repository) = deps(true);
-        let connection = ConnectionInfo {
+        let connection = ConnectionInfo::Postgres(PostgresConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: 5432,
             dbname: "app_salmon".to_string(),
             user: "app_salmon".to_string(),
             password: Redacted::new("hunter2".to_string()),
-        };
+        });
         let cluster = base_cluster(
             ClusterState::Ready {
                 ready_at: Utc::now(),
@@ -238,13 +240,13 @@ mod tests {
     #[tokio::test]
     async fn ready_cluster_with_dead_backend_becomes_failed() {
         let (deps, repository) = deps(false);
-        let connection = ConnectionInfo {
+        let connection = ConnectionInfo::Postgres(PostgresConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: 5432,
             dbname: "app_salmon".to_string(),
             user: "app_salmon".to_string(),
             password: Redacted::new("hunter2".to_string()),
-        };
+        });
         let cluster = base_cluster(
             ClusterState::Ready {
                 ready_at: Utc::now(),
@@ -460,13 +462,13 @@ mod tests {
             fail_list_all: AtomicBool::new(false),
             fail_update_state: AtomicBool::new(true),
         });
-        let connection = ConnectionInfo {
+        let connection = ConnectionInfo::Postgres(PostgresConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: 5432,
             dbname: "app_salmon".to_string(),
             user: "app_salmon".to_string(),
             password: Redacted::new("hunter2".to_string()),
-        };
+        });
         let cluster = base_cluster(
             ClusterState::Ready {
                 ready_at: Utc::now(),
@@ -538,13 +540,13 @@ mod tests {
     #[tokio::test]
     async fn is_alive_error_is_logged_and_cluster_left_alone() {
         let repository = Arc::new(InMemoryClusterRepository::new());
-        let connection = ConnectionInfo {
+        let connection = ConnectionInfo::Postgres(PostgresConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: 5432,
             dbname: "app_salmon".to_string(),
             user: "app_salmon".to_string(),
             password: Redacted::new("hunter2".to_string()),
-        };
+        });
         let cluster = base_cluster(
             ClusterState::Ready {
                 ready_at: Utc::now(),
@@ -582,13 +584,13 @@ mod tests {
     #[tokio::test]
     async fn ready_cluster_with_no_registered_backend_is_left_alone() {
         let repository = Arc::new(InMemoryClusterRepository::new());
-        let connection = ConnectionInfo {
+        let connection = ConnectionInfo::Postgres(PostgresConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: 5432,
             dbname: "app_salmon".to_string(),
             user: "app_salmon".to_string(),
             password: Redacted::new("hunter2".to_string()),
-        };
+        });
         let cluster = base_cluster(
             ClusterState::Ready {
                 ready_at: Utc::now(),

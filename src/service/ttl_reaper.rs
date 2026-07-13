@@ -135,7 +135,9 @@ mod tests {
     use crate::client_workers::ClientWorkers;
     use crate::domain::cluster::{ClusterState, DeleteReason};
     use crate::domain::ids::ClientId;
-    use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
+    use crate::domain::service_kind::{
+        ConnectionInfo, PostgresConnectionInfo, ServiceKind, ServiceSpec,
+    };
     use crate::ports::clock::{Clock, FakeClock};
     use crate::redacted::Redacted;
     use crate::service::cluster_service::{ClusterService, DeleteOutcome, Limits};
@@ -214,13 +216,13 @@ mod tests {
                 &ClusterState::Ready {
                     ready_at,
                     decommission_at,
-                    connection: ConnectionInfo {
+                    connection: ConnectionInfo::Postgres(PostgresConnectionInfo {
                         host: "127.0.0.1".to_string(),
                         port: 5432,
                         dbname: "app_salmon".to_string(),
                         user: "app_salmon".to_string(),
                         password: Redacted::new("hunter2".to_string()),
-                    },
+                    }),
                 },
             )
             .await
@@ -306,13 +308,13 @@ mod tests {
                 &ClusterState::Ready {
                     ready_at,
                     decommission_at: ready_at,
-                    connection: ConnectionInfo {
+                    connection: ConnectionInfo::Postgres(PostgresConnectionInfo {
                         host: "127.0.0.1".to_string(),
                         port: 5432,
                         dbname: "app_salmon".to_string(),
                         user: "app_salmon".to_string(),
                         password: Redacted::new("hunter2".to_string()),
-                    },
+                    }),
                 },
             )
             .await
@@ -353,13 +355,13 @@ mod tests {
                 &ClusterState::Ready {
                     ready_at,
                     decommission_at: ready_at,
-                    connection: ConnectionInfo {
+                    connection: ConnectionInfo::Postgres(PostgresConnectionInfo {
                         host: "127.0.0.1".to_string(),
                         port: 5432,
                         dbname: "app_salmon".to_string(),
                         user: "app_salmon".to_string(),
                         password: Redacted::new("hunter2".to_string()),
-                    },
+                    }),
                 },
             )
             .await

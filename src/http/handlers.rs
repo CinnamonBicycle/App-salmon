@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::cluster::{Cluster, ClusterState, DeleteReason};
 use crate::domain::ids::ClusterId;
-use crate::domain::service_kind::{ServiceKind, ServiceSpec};
+use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
 use crate::error::ApiError;
 use crate::http::{AppState, AuthenticatedClient};
 use crate::service::cluster_service::DeleteOutcome;
@@ -46,9 +46,11 @@ pub struct CreateClusterResponse {
     pub estimated_ready_at: DateTime<Utc>,
 }
 
-/// Connection details for a `Ready` cluster.
+/// Postgres connection details, standalone for a `ServiceKind::Postgres` cluster or nested inside
+/// [`ConnectionResponse::Supabase`] for the underlying Postgres instance of a
+/// `ServiceKind::Supabase` cluster.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct ConnectionResponse {
+pub struct PostgresConnectionResponse {
     /// Host to connect to (always `127.0.0.1`, since App Salmon and its clusters share a host).
     pub host: String,
     /// Port to connect to.
@@ -59,6 +61,39 @@ pub struct ConnectionResponse {
     pub user: String,
     /// Database password, in plaintext (this endpoint is the one place it's ever exposed).
     pub password: String,
+}
+
+/// Connection details for a `Ready` cluster — which variant is returned matches the cluster's
+/// `ServiceKind`.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConnectionResponse {
+    /// Connection details for a `ServiceKind::Postgres` cluster.
+    Postgres {
+        /// Host to connect to.
+        host: String,
+        /// Port to connect to.
+        port: u16,
+        /// Database name.
+        dbname: String,
+        /// Database user.
+        user: String,
+        /// Database password, in plaintext.
+        password: String,
+    },
+    /// Connection details for a `ServiceKind::Supabase` cluster.
+    Supabase {
+        /// Kong's published `host:port` — the single ingress for API/auth/edge-function traffic.
+        api_url: String,
+        /// Direct connection details for the underlying Postgres instance.
+        postgres: PostgresConnectionResponse,
+        /// A JWT signed with the `anon` role, in plaintext.
+        anon_key: String,
+        /// A JWT signed with the `service_role` role, in plaintext.
+        service_role_key: String,
+        /// The secret `anon_key`/`service_role_key` are signed with, in plaintext.
+        jwt_secret: String,
+    },
 }
 
 /// The body of `GET /clusters/{id}` (and each entry of `GET /clusters`) — which variant is
@@ -119,6 +154,42 @@ pub struct DeleteResponse {
     pub status: &'static str,
 }
 
+/// Maps a domain [`ConnectionInfo`] onto the wire [`ConnectionResponse`] shape, exposing every
+/// secret as plaintext — this response is the one place that's meant to happen (matching
+/// [`PostgresConnectionResponse::password`]'s existing doc comment).
+///
+/// # Arguments
+///
+/// - `connection`: the connection info to translate.
+///
+/// # Returns
+///
+/// The matching [`ConnectionResponse`] variant.
+fn connection_response(connection: &ConnectionInfo) -> ConnectionResponse {
+    match connection {
+        ConnectionInfo::Postgres(postgres) => ConnectionResponse::Postgres {
+            host: postgres.host.clone(),
+            port: postgres.port,
+            dbname: postgres.dbname.clone(),
+            user: postgres.user.clone(),
+            password: postgres.password.expose().clone(),
+        },
+        ConnectionInfo::Supabase(supabase) => ConnectionResponse::Supabase {
+            api_url: supabase.api_url.clone(),
+            postgres: PostgresConnectionResponse {
+                host: supabase.postgres.host.clone(),
+                port: supabase.postgres.port,
+                dbname: supabase.postgres.dbname.clone(),
+                user: supabase.postgres.user.clone(),
+                password: supabase.postgres.password.expose().clone(),
+            },
+            anon_key: supabase.anon_key.expose().clone(),
+            service_role_key: supabase.service_role_key.expose().clone(),
+            jwt_secret: supabase.jwt_secret.expose().clone(),
+        },
+    }
+}
+
 /// Maps a cluster's current lifecycle state to the HTTP status code and response body `GET`
 /// endpoints should return for it.
 ///
@@ -154,13 +225,7 @@ fn info_response(
                 requested_at: cluster.requested_at,
                 started_at: *ready_at,
                 scheduled_decommission_at: *decommission_at,
-                connection: ConnectionResponse {
-                    host: connection.host.clone(),
-                    port: connection.port,
-                    dbname: connection.dbname.clone(),
-                    user: connection.user.clone(),
-                    password: connection.password.expose().clone(),
-                },
+                connection: connection_response(connection),
             },
         ),
         ClusterState::Failed {

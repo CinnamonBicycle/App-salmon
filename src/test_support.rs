@@ -12,7 +12,9 @@ use ulid::Ulid;
 use crate::backends::ClusterBackend;
 use crate::domain::cluster::{Cluster, ClusterError, ClusterState};
 use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
-use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
+use crate::domain::service_kind::{
+    ConnectionInfo, PostgresConnectionInfo, ServiceKind, ServiceSpec,
+};
 use crate::ports::privileged_exec::{
     CommandOutput, PrivilegedCommand, PrivilegedExecError, PrivilegedExecutor,
 };
@@ -206,13 +208,13 @@ impl ClusterBackend for FastSucceedingClusterBackend {
         _slot: u32,
         _service: &ServiceSpec,
     ) -> Result<ConnectionInfo, ClusterError> {
-        Ok(ConnectionInfo {
+        Ok(ConnectionInfo::Postgres(PostgresConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: 55432,
             dbname: "app_salmon".to_string(),
             user: "app_salmon".to_string(),
             password: crate::redacted::Redacted::new("hunter2".to_string()),
-        })
+        }))
     }
 
     async fn teardown(&self, _cluster_id: &ClusterId) -> Result<(), ClusterError> {

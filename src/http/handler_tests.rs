@@ -21,7 +21,9 @@ use crate::backends::ClusterBackend;
 use crate::client_workers::ClientWorkers;
 use crate::domain::cluster::ClusterState;
 use crate::domain::ids::{ClientId, ClusterId, WorkerUser};
-use crate::domain::service_kind::{ConnectionInfo, ServiceKind};
+use crate::domain::service_kind::{
+    ConnectionInfo, PostgresConnectionInfo, ServiceKind, SupabaseConnectionInfo,
+};
 use crate::http::{AppState, router};
 use crate::ports::clock::{Clock, FakeClock};
 use crate::ports::repository::ClusterRepository;
@@ -269,13 +271,13 @@ async fn get_cluster_ready_returns_200_with_connection_info() {
             &ClusterState::Ready {
                 ready_at,
                 decommission_at: ready_at + TimeDelta::seconds(300),
-                connection: ConnectionInfo {
+                connection: ConnectionInfo::Postgres(PostgresConnectionInfo {
                     host: "127.0.0.1".to_string(),
                     port: 55432,
                     dbname: "app_salmon".to_string(),
                     user: "app_salmon".to_string(),
                     password: Redacted::new("hunter2".to_string()),
-                },
+                }),
             },
         )
         .await
@@ -293,6 +295,57 @@ async fn get_cluster_ready_returns_200_with_connection_info() {
     assert_eq!(body["status"], "ready");
     assert_eq!(body["connection"]["password"], "hunter2");
     assert_eq!(body["connection"]["port"], 55432);
+    assert_eq!(body["connection"]["kind"], "postgres");
+}
+
+#[tokio::test]
+async fn get_cluster_ready_returns_200_with_supabase_connection_info() {
+    let (app, repository, clock) = test_app();
+    let (_, created) = create_cluster(&app, 300).await;
+    let id_str = created["id"].as_str().expect("id present").to_string();
+    let id: ClusterId = id_str.parse().expect("valid ulid");
+
+    let ready_at = clock.now();
+    repository
+        .update_state(
+            &id,
+            &ClusterState::Ready {
+                ready_at,
+                decommission_at: ready_at + TimeDelta::seconds(300),
+                connection: ConnectionInfo::Supabase(SupabaseConnectionInfo {
+                    api_url: "http://127.0.0.1:8000".to_string(),
+                    postgres: PostgresConnectionInfo {
+                        host: "127.0.0.1".to_string(),
+                        port: 55432,
+                        dbname: "postgres".to_string(),
+                        user: "postgres".to_string(),
+                        password: Redacted::new("hunter2".to_string()),
+                    },
+                    anon_key: Redacted::new("anon.jwt".to_string()),
+                    service_role_key: Redacted::new("service.jwt".to_string()),
+                    jwt_secret: Redacted::new("jwt-secret-value".to_string()),
+                }),
+            },
+        )
+        .await
+        .expect("mark ready");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/clusters/{id_str}"))
+        .header(auth_header().0, auth_header().1)
+        .body(Body::empty())
+        .expect("build request");
+    let response = app.oneshot(request).await.expect("call succeeds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["connection"]["kind"], "supabase");
+    assert_eq!(body["connection"]["api_url"], "http://127.0.0.1:8000");
+    assert_eq!(body["connection"]["postgres"]["port"], 55432);
+    assert_eq!(body["connection"]["anon_key"], "anon.jwt");
+    assert_eq!(body["connection"]["service_role_key"], "service.jwt");
+    assert_eq!(body["connection"]["jwt_secret"], "jwt-secret-value");
 }
 
 #[tokio::test]

@@ -27,7 +27,9 @@ use crate::backends::ClusterBackend;
 use crate::client_workers::worker_data_dir;
 use crate::domain::cluster::ClusterError;
 use crate::domain::ids::{ClusterId, WorkerUser};
-use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
+use crate::domain::service_kind::{
+    ConnectionInfo, PostgresConnectionInfo, ServiceKind, ServiceSpec,
+};
 use crate::ports::container_runtime::{
     BindMount, ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, DockerError,
     HealthCheck, HealthState, OciRuntime,
@@ -296,13 +298,13 @@ impl ClusterBackend for PostgresBackend {
                 })?;
         }
 
-        Ok(ConnectionInfo {
+        Ok(ConnectionInfo::Postgres(PostgresConnectionInfo {
             host: "127.0.0.1".to_string(),
             port: host_port,
             dbname: DB_NAME.to_string(),
             user: DB_USER.to_string(),
             password: Redacted::new(password),
-        })
+        }))
     }
 
     /// Stops and removes the container `spawn` created for `cluster_id`, recomputing its name
@@ -355,7 +357,7 @@ mod tests {
     use super::{PostgresBackend, container_name};
     use crate::backends::ClusterBackend;
     use crate::domain::ids::{ClusterId, WorkerUser};
-    use crate::domain::service_kind::{ServiceKind, ServiceSpec};
+    use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
     use crate::ports::container_runtime::{
         ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, DockerError,
     };
@@ -557,6 +559,9 @@ mod tests {
             .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, 0, &service)
             .await
             .expect("healthy container is a successful spawn");
+        let ConnectionInfo::Postgres(connection) = connection else {
+            panic!("expected Postgres connection info");
+        };
         assert_eq!(connection.port, 55432);
         assert_eq!(connection.host, "127.0.0.1");
         assert_eq!(connection.dbname, "app_salmon");
