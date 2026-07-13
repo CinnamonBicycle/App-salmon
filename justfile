@@ -1,24 +1,18 @@
 # Single-command entry points for App Salmon. `just ci` is what CI (and you, before committing)
 # should run; the pieces are also independently runnable.
 
-# Run everything CI checks: formatting, lint, unit coverage, and e2e if this machine is set up
-# for it (never silently skipped — see `test-e2e`). Prefers, in order: a persistent e2e VM
-# already up (fast — no boot/provision cost per run), then the bare-host setup, then a reminder
-# covering every option if neither is available. Deliberately does NOT boot a VM itself — that's
-# a multi-minute image-download-and-boot cost, too heavy for a gate you might run many times
-# while iterating; `just e2e-vm-up` stays a separate, deliberate step.
+# Run everything CI checks: formatting, lint, unit coverage, and e2e if a persistent e2e VM is up
+# (never silently skipped — prints exactly what to run otherwise). Deliberately does NOT boot a
+# VM itself — that's a multi-minute image-download-and-boot cost, too heavy for a gate you might
+# run many times while iterating; `just e2e-vm-up` stays a separate, deliberate step.
 ci: fmt-check lint test-unit
     #!/usr/bin/env bash
     set -euo pipefail
     if ./scripts/vm/e2e-vm-status.sh >/dev/null 2>&1; then
         just e2e-vm-test
-    elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && id e2e-agent >/dev/null 2>&1; then
-        just test-e2e
     else
-        echo "e2e prerequisites not detected (no persistent e2e VM up, and no bare-host docker +"
-        echo "e2e-agent account). Options, in order of preference:"
-        echo "  just setup-e2e-vm && just e2e-vm-up && just ci    (persistent VM, reused across runs)"
-        echo "  sudo ./scripts/setup-e2e-env.sh && just test-e2e  (root, persists e2e system accounts)"
+        echo "no persistent e2e VM is up. Run:"
+        echo "  just setup-e2e-vm && just e2e-vm-up && just ci"
     fi
 
 # Format the whole workspace.
@@ -37,16 +31,6 @@ lint:
 test-unit:
     cargo test --lib
 
-# End-to-end suite (`tests/e2e`) — requires `sudo ./scripts/setup-e2e-env.sh` to have been run on
-# this machine first. Fails loudly (not silently) if prerequisites are missing; single-threaded
-# since most tests share one client account's max_clusters_per_user quota, and parallel test
-# functions creating clusters against the same account would spuriously race each other's quota.
-test-e2e:
-    cargo test --test e2e -- --test-threads=1
-
-# Both test suites.
-test-all: test-unit test-e2e
-
 # Unit-test coverage (excludes `tests/e2e`, which cargo-llvm-cov doesn't instrument the same way
 # and which needs real infra anyway). Requires `cargo install cargo-llvm-cov` +
 # `rustup component add llvm-tools-preview` once per machine.
@@ -62,15 +46,7 @@ coverage-html:
 run config="config.toml":
     cargo run -- --config {{ config }}
 
-# One-time setup for running the e2e suite directly on this machine (worker accounts, sudoers
-# rule, postgres image). Needs root, and persists App-Salmon-specific system accounts and a
-# sudoers rule on this machine for as long as you keep them. Prefer `just setup-e2e-vm` +
-# `just e2e-vm-up` + `just e2e-vm-test` unless you specifically want the suite to run against
-# this host directly.
-setup-e2e:
-    sudo ./scripts/setup-e2e-env.sh
-
-# One-time setup for running the e2e suite inside a disposable VM instead (see e2e-vm-up below):
+# One-time setup for running the e2e suite inside a disposable VM (see e2e-vm-up below):
 # installs QEMU if missing and adds you to the `kvm` group if needed. Needs sudo only for those
 # two ordinary, generic, one-time things — nothing App-Salmon-specific, nothing that persists
 # beyond "this machine can run QEMU with KVM acceleration", which most dev machines want anyway.

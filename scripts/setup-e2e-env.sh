@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Idempotent setup for running App Salmon's e2e suite (`just test-e2e`) on this machine.
+# Idempotent setup for running App Salmon's e2e suite on a machine. Not meant to be run directly
+# on your own machine — `scripts/vm/guest-provision.sh` runs this automatically, as root, inside
+# the disposable e2e VM (see `just e2e-vm-up`/`e2e-vm-test`, docs/DESIGN.md §8c). There used to be
+# a bare-host path that ran this directly (`just setup-e2e`); it was removed (§8d) once the VM
+# path covered the same need without the persistent host-level changes below.
 #
-# Needs root (creates system users, writes /etc/sudoers.d). Run once per machine:
-#   sudo ./scripts/setup-e2e-env.sh
+# Needs root (creates system users, writes /etc/sudoers.d).
 #
 # What it does:
 #   1. Creates one Unix account per e2e test client (see APP_SALMON_E2E_CLIENTS below) — no

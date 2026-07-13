@@ -312,16 +312,10 @@ both are still first-guess values from the original design writeup.
 
 ## 8. Operator prerequisites (stub — full runbook is deferred, §7f)
 
-This section describes running `app_salmon` (and its e2e suite) directly against a host. §8c
-describes an alternative for the e2e suite specifically — `just e2e-vm-up` / `e2e-vm-test` — that
-avoids the root requirement in the first bullet below entirely, by running it inside a disposable
-VM instead; that's the recommended way to run the e2e suite unless you specifically want it
-against a real host.
+This section describes prerequisites for running the `app_salmon` *service* on a real host —
+production or otherwise. Its e2e *test suite* is a separate concern, covered entirely by §8c/§8d
+now: it only ever runs inside a disposable VM, never directly against a real host.
 
-- `scripts/setup-e2e-env.sh` (must run as root): creates one Unix account per configured e2e
-  client, writes a `/etc/sudoers.d/app-salmon` rule scoped to exactly `mkdir -p <path>` and
-  `find <path> -mindepth 1 -delete` against that client's `max_clusters_per_user` literal
-  directory-slot paths (no wildcard — see §6 for why), and pulls the configured Postgres image.
 - The `app_salmon` config (`config.toml`) needs: a `[[clients]]` entry per client account, each
   with `secret_hash = "sha256:<64 hex chars>"` (the hash of a secret generated and distributed to
   that client account out of band — no CLI tooling for this yet, `sha256sum` a random string by
@@ -548,24 +542,43 @@ pre-fix VM before rebuilding with the `vm_sync_repo` fix. At this point every co
 `setup-e2e-vm` → `e2e-vm-up` → `e2e-vm-test` → `e2e-vm-down` cycle has been run for real against a
 real KVM host at least once.
 
+## 8d. Removed: bare-host e2e testing (`test-e2e`/`setup-e2e`)
+
+Before §8c, `just setup-e2e` (`scripts/setup-e2e-env.sh`, run as root) plus `just test-e2e`
+(`cargo test --test e2e`) was the only way to run the e2e suite: directly against the real host,
+creating persistent `e2e-agent`/`e2e-agent-other` Unix accounts and a `/etc/sudoers.d` rule that
+stuck around afterward. Removed once §8c covered the same need without that persistence.
+
+**Explicit reasoning for removing it outright, rather than keeping it as a documented fallback**
+(the decision that shaped this, and worth stating for future readers of this file): a code path
+that nothing exercises decays silently, and this project had just watched that happen — the
+one-shot VM path (§8b) sat broken through the per-client-account refactor without anyone
+noticing, precisely because nothing was running it. Keeping `test-e2e`/`setup-e2e` "just in case"
+would have reintroduced exactly that risk: a second e2e entry point nobody runs day to day,
+quietly drifting out of sync with whatever `tests/e2e/*` or `scripts/setup-e2e-env.sh` need next,
+discovered broken only when someone actually reaches for it. If a line of code matters enough to
+keep, it has to be exercised, or the question of whether it still works is just unanswered — and
+if it isn't exercised, keeping it costs real maintenance burden for a guarantee that doesn't
+actually hold. `scripts/setup-e2e-env.sh` itself was **not** deleted — `guest-provision.sh` still
+calls it, now exclusively inside the disposable VM (§8c), where it's exercised on every
+`e2e-vm-up`/`e2e-vm-test` and therefore actually kept honest.
+
 ## 9. Testing & coverage
 
 - `just ci` — the single command: format check, clippy (deny-on-warnings, `--all-targets
-  --all-features`), unit tests, and the e2e suite against whichever of the following is
-  available, in order: a persistent e2e VM already up (§8c), the bare-host setup (checked via
-  `docker info` + `id e2e-agent`), or — if neither — a clear message listing both ways to get one
-  running, never a silent skip.
-- `just test-unit` / `just test-e2e` / `just test-all` — independently runnable, per the
-  requirement that unit and e2e stay separable.
-- `just setup-e2e-vm` / `e2e-vm-up` / `e2e-vm-test` / `e2e-vm-down` (recommended over
-  `setup-e2e`/`test-e2e`) — runs the e2e suite inside a disposable, persistent QEMU VM instead of
-  on this machine, so `setup-e2e-env.sh`'s host-level changes never touch the machine actually
-  running the tooling; this machine only needs QEMU + `/dev/kvm` access, which `setup-e2e-vm` gets
-  for you (sudo used once, for two generic non-App-Salmon-specific things). The VM stays up across
-  multiple test runs instead of being discarded every call, and `just ci` detects and uses it
-  automatically once it's up. See §8c for the design, the SSH transport's security model, and its
-  verification status (confirmed working end to end against a real KVM host, including all 18 e2e
-  tests and the arbitrary-uid Postgres path from §8a).
+  --all-features`), unit tests, and the e2e suite if a persistent e2e VM is already up (§8c) —
+  never a silent skip; prints exactly what to run if one isn't.
+- `just test-unit` — independently runnable, per the requirement that unit and e2e stay
+  separable.
+- `just setup-e2e-vm` / `e2e-vm-up` / `e2e-vm-test` / `e2e-vm-down` — the e2e suite's only path
+  (§8d), runs it inside a disposable, persistent QEMU VM, so `setup-e2e-env.sh`'s host-level
+  changes never touch the machine actually running the tooling; this machine only needs QEMU +
+  `/dev/kvm` access, which `setup-e2e-vm` gets for you (sudo used once, for two generic
+  non-App-Salmon-specific things). The VM stays up across multiple test runs instead of being
+  discarded every call, and `just ci` detects and uses it automatically once it's up. See §8c for
+  the design, the SSH transport's security model, and its verification status (confirmed working
+  end to end against a real KVM host, including all 18 e2e tests and the arbitrary-uid Postgres
+  path from §8a).
 - `just coverage` (needs `cargo install cargo-llvm-cov` + `rustup component add
   llvm-tools-preview` once per machine) — measures the **entire** `--lib` target, no
   `--ignore-filename-regex` carve-out for adapters. Current state (2026-07-12): 96.2% region /
