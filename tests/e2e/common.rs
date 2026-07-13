@@ -168,6 +168,7 @@ pub async fn spawn_test_server() -> TestServer {
         task_deps: task_deps.clone(),
         task_registry: Arc::new(TaskRegistry::new()),
         spawn_estimate: TimeDelta::seconds(20),
+        max_tar_bytes: 52_428_800,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

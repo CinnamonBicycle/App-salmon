@@ -804,7 +804,77 @@ registered runtime before doing anything) implementing exactly the sequence abov
 `3.32.0` deliberately (not "latest" — bump by re-verifying, not by drifting, matching this
 project's established pattern for the base cloud image and other fixed dependencies).
 
-**Not yet built:** all of the Rust-side work (M1 onward) — `OciRuntime` enum on `ContainerSpec`,
-per-cluster Docker networking, `SupabaseBackend`, tar validation, the HTTP multipart upload path.
-M0 specifically was the hard, early-gated dependency risk; passing it means the rest of the work
-can proceed with confidence the underlying mechanism works, but none of it exists yet.
+### M1 — `ContainerRuntime`/`ContainerSpec` extension: done
+
+`ContainerSpec` gained a closed `OciRuntime { Runc, Kata }` enum field (`pub runtime`,
+non-optional — every call site states its choice explicitly) instead of the `Option<String>` an
+earlier draft used, plus an `Option<NetworkAttachment { network_name, alias }>` field for
+Kong-reaches-PostgREST/GoTrue/Postgres-by-name networking. `docker_bollard.rs` maps
+`OciRuntime::Runc` to Docker's default (`HostConfig.runtime` omitted) and `OciRuntime::Kata` to
+`HostConfig.runtime = Some(<configured kata runtime name>)` — the *choice* of runtime is now a
+compile-time-checked enum; the *installed name* the guest's `daemon.json` registers it under
+remains a runtime string, since that's a genuine operational detail (see the M0 section above for
+what that string looks like in practice: `"kata"`, registered via `runtimeType`). New
+`create_network`/`remove_network` port methods (idempotent, matching `stop_and_remove`'s pattern),
+backed by `bollard::Docker::create_network`/`remove_network`. Fake-tested only, against the
+existing fake Docker Engine API test server extended with network create/remove handlers;
+`PostgresBackend` passes `runtime: OciRuntime::Runc, network: None` and is otherwise unaffected.
+
+### M2 — `ConnectionInfo` → enum, `ServiceKind::Supabase` variant: done
+
+`ServiceKind` gained `Supabase`; `ConnectionInfo` became a closed enum
+(`Postgres(PostgresConnectionInfo)` / `Supabase(SupabaseConnectionInfo)`) rather than one flat
+struct, matching `ClusterState`'s established closed-enum pattern — `SupabaseConnectionInfo`
+carries `api_url` (Kong's published address), a nested `PostgresConnectionInfo`, and
+`anon_key`/`service_role_key`/`jwt_secret` (all `Redacted<String>`). Ripples through
+`sqlite_repository.rs`'s `PersistedConnection` (kept as a hand-written `From` impl, not derived —
+it's the deliberate point where secrets get unwrapped for persistence) and `http/handlers.rs`'s
+`ConnectionResponse` (a `#[serde(tag = "kind")]` enum, same pattern as `ClusterInfoResponse`). No
+backend is registered for `ServiceKind::Supabase` yet — a request for it fails the same way an
+unregistered kind already did (`ClusterError::BackendSpawnFailed`, surfaced as a `Failed` cluster
+state), which is exactly the state M3 below builds on.
+
+### M3 — multipart tar upload + tar-validation module: done
+
+Two independent pieces, deliberately not yet wired together — see the scope note below.
+
+**`src/domain/tar_validation.rs`**: validates and extracts an untrusted tar archive using the
+`tar` crate's own documented-safe primitive, `Entry::unpack_in`, rather than a hand-rolled path-
+joining reimplementation — confirmed by reading `unpack_in`'s actual source (not just its docs)
+that it correctly strips a leading root component and rejects `..` outright. Pinned to
+`tar = "0.4.46"` specifically: RUSTSEC-2026-0067, a real symlink-following `chmod` bug in
+`unpack_in` itself, was fixed in 0.4.45. Layers checks on top of what `unpack_in` doesn't cover by
+its own docs: entry type restricted to `Regular`/`Directory` (symlinks, hardlinks, device/fifo
+files rejected outright, never target-validated), plus per-entry and cumulative size caps checked
+from the header *before* extraction (bounding decompression-bomb-style abuse, which `unpack_in`
+doesn't bound either). Fully unit-tested with in-memory tars built via the crate's own `Builder`,
+including hand-crafted-header test fixtures that bypass `Header::set_path`'s own safety validation
+(needed because a real attacker's tar wouldn't be built through that safe API either).
+
+**HTTP**: `POST /clusters` now branches on `Content-Type`. `application/json` is unchanged and
+only accepts `ServiceKind::Postgres`. `multipart/form-data` (`axum::extract::Multipart`) accepts
+two parts — `metadata` (JSON, same shape as the JSON body) and `project_tar` (raw bytes) — and
+only accepts `ServiceKind::Supabase`; either kind sent the wrong way is rejected with `400`. A new
+`[limits].max_tar_bytes` config value sizes a `DefaultBodyLimit` layer scoped to the `/clusters`
+route only (every other route keeps axum's built-in 2MB default).
+
+**Deliberate scope boundary, decided explicitly rather than drifted into:** M3 does *not* call
+`tar_validation` from the HTTP layer, and does not thread the uploaded tar bytes anywhere past the
+handler — they're read (so the size cap is actually enforced) and dropped once the handler
+returns. The reason: the tar's *destination* is the cluster's worker/slot directory, which isn't
+assigned until `cluster_service.create()` returns, and isn't created on disk until the background
+spawn task's privileged `PrepareWorkerDir` step runs — neither exists yet at the point `POST
+/clusters` is handling the multipart request. Extracting into a throwaway temp directory just to
+validate structure at upload time, only to discard it and re-extract for real later, would mean
+writing code in M3 that gets deleted in M4 once the real extraction point (`SupabaseBackend::spawn`,
+which *does* know the destination) exists — exactly the kind of unexercised, soon-superseded path
+this project avoids. So: byte cap at the edge now (M3); structural tar validation happens exactly
+once, in M4, at the point that actually has a destination to extract into.
+
+### Not yet built
+
+M4 (`SupabaseBackend` — data-driven service list, network lifecycle, concurrent dependency-aware
+health-wait, JWT signing, the point where `tar_validation` actually gets called against a real
+worker/slot directory) onward: wiring `SupabaseBackend` into the backend registry (M5), and real
+e2e verification of the whole stack — including a genuine tar-supplied edge function executing
+under Kata — in the VM (M6).

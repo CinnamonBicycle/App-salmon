@@ -248,6 +248,7 @@ async fn run(config: Config) -> Result<(), AppStartupError> {
         spawn_estimate: TimeDelta::seconds(
             i64::try_from(config.limits.spawn_estimate_secs).unwrap_or(i64::MAX),
         ),
+        max_tar_bytes: config.limits.max_tar_bytes,
     };
 
     tokio::spawn(ttl_reaper::run_forever(

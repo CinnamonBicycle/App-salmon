@@ -96,6 +96,7 @@ fn test_app_with_backend(
         task_deps,
         task_registry: Arc::new(TaskRegistry::new()),
         spawn_estimate: TimeDelta::seconds(20),
+        max_tar_bytes: 1_048_576,
     };
 
     (router(state), repository, clock)
@@ -134,6 +135,50 @@ async fn create_cluster(app: &Router, ttl_secs: i64) -> (StatusCode, Value) {
             )
             .expect("serialize"),
         ))
+        .expect("build request");
+    let response = app.clone().oneshot(request).await.expect("call succeeds");
+    let status = response.status();
+    (status, json_body(response).await)
+}
+
+const MULTIPART_BOUNDARY: &str = "app-salmon-test-boundary";
+
+/// Builds a raw `multipart/form-data` body with a `metadata` part (`metadata_json`, sent as-is —
+/// callers control whether it's valid JSON) and, unless `omit_project_tar` is set, a
+/// `project_tar` part carrying `project_tar` as raw bytes.
+fn multipart_body(metadata_json: &str, project_tar: Option<&[u8]>) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"metadata\"\r\n\r\n");
+    body.extend_from_slice(metadata_json.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    if let Some(project_tar) = project_tar {
+        body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"project_tar\"; filename=\"project.tar\"\r\n\
+              Content-Type: application/x-tar\r\n\r\n",
+        );
+        body.extend_from_slice(project_tar);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+async fn create_cluster_multipart(
+    app: &Router,
+    metadata_json: &str,
+    project_tar: Option<&[u8]>,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/clusters")
+        .header(auth_header().0, auth_header().1)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}"),
+        )
+        .body(Body::from(multipart_body(metadata_json, project_tar)))
         .expect("build request");
     let response = app.clone().oneshot(request).await.expect("call succeeds");
     let status = response.status();
@@ -208,6 +253,129 @@ async fn create_cluster_beyond_quota_is_too_many_requests() {
     assert_eq!(first_status, StatusCode::ACCEPTED);
     assert_eq!(second_status, StatusCode::ACCEPTED);
     assert_eq!(third_status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn create_cluster_supabase_multipart_valid_request_is_accepted_as_spawning() {
+    let (app, _repository, _clock) = test_app();
+    let metadata = json!({"service": "supabase", "ttl_secs": 300}).to_string();
+    let (status, body) =
+        create_cluster_multipart(&app, &metadata, Some(b"not a real tar, doesn't matter yet"))
+            .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["status"], "spawning");
+    assert!(body["id"].is_string());
+}
+
+#[tokio::test]
+async fn create_cluster_supabase_as_json_is_bad_request() {
+    let (app, _repository, _clock) = test_app();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/clusters")
+        .header(auth_header().0, auth_header().1)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"service": "supabase", "ttl_secs": 300}))
+                .expect("serialize"),
+        ))
+        .expect("build request");
+    let response = app.oneshot(request).await.expect("call succeeds");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_cluster_postgres_as_multipart_is_bad_request() {
+    let (app, _repository, _clock) = test_app();
+    let metadata = json!({"service": "postgres", "ttl_secs": 300}).to_string();
+    let (status, _body) =
+        create_cluster_multipart(&app, &metadata, Some(b"irrelevant bytes")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_cluster_multipart_missing_project_tar_is_bad_request() {
+    let (app, _repository, _clock) = test_app();
+    let metadata = json!({"service": "supabase", "ttl_secs": 300}).to_string();
+    let (status, _body) = create_cluster_multipart(&app, &metadata, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_cluster_multipart_missing_metadata_is_bad_request() {
+    let (app, _repository, _clock) = test_app();
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"project_tar\"; filename=\"project.tar\"\r\n\
+          Content-Type: application/x-tar\r\n\r\nirrelevant bytes\r\n",
+    );
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/clusters")
+        .header(auth_header().0, auth_header().1)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}"),
+        )
+        .body(Body::from(body))
+        .expect("build request");
+    let response = app.oneshot(request).await.expect("call succeeds");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_cluster_multipart_malformed_metadata_json_is_bad_request() {
+    let (app, _repository, _clock) = test_app();
+    let (status, _body) =
+        create_cluster_multipart(&app, "not valid json", Some(b"irrelevant bytes")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_cluster_multipart_ignores_unrecognized_parts() {
+    let (app, _repository, _clock) = test_app();
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"something_else\"\r\n\r\nignored\r\n",
+    );
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"metadata\"\r\n\r\n");
+    body.extend_from_slice(
+        json!({"service": "supabase", "ttl_secs": 300})
+            .to_string()
+            .as_bytes(),
+    );
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Disposition: form-data; name=\"project_tar\"; filename=\"project.tar\"\r\n\
+          Content-Type: application/x-tar\r\n\r\nirrelevant bytes\r\n",
+    );
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
+    let request = Request::builder()
+        .method("POST")
+        .uri("/clusters")
+        .header(auth_header().0, auth_header().1)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}"),
+        )
+        .body(Body::from(body))
+        .expect("build request");
+    let response = app.oneshot(request).await.expect("call succeeds");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn create_cluster_multipart_project_tar_over_the_body_limit_is_bad_request() {
+    let (app, _repository, _clock) = test_app();
+    let metadata = json!({"service": "supabase", "ttl_secs": 300}).to_string();
+    let oversized = vec![0_u8; 2 * 1_048_576];
+    let (status, _body) = create_cluster_multipart(&app, &metadata, Some(&oversized)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

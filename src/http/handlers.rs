@@ -5,8 +5,8 @@
 //! outcome of a successful lookup, not a failure this handler experienced.
 
 use axum::Json;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRequest, Multipart, Path, Request, State};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,13 +19,17 @@ use crate::http::{AppState, AuthenticatedClient};
 use crate::service::cluster_service::DeleteOutcome;
 use crate::service::{spawn_task, teardown_task};
 
-/// The `POST /clusters` request body.
+/// The `POST /clusters` request body. For `ServiceKind::Postgres`, sent directly as a JSON
+/// request body. For `ServiceKind::Supabase`, sent as the `metadata` part of a
+/// `multipart/form-data` request alongside a `project_tar` part (see [`create_cluster`]) — the
+/// shape is identical either way.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateClusterRequest {
-    /// Which kind of service to provision (currently only `postgres`).
+    /// Which kind of service to provision. `Supabase` requires the `multipart/form-data` path;
+    /// `Postgres` requires the plain-JSON path (see [`create_cluster`]).
     pub service: ServiceKind,
     /// Whether to enable the `pgvector` extension once the database is ready. Defaults to
-    /// `false` if omitted.
+    /// `false` if omitted. Ignored for `ServiceKind::Supabase`, which always enables it.
     #[serde(default)]
     pub pgvector: bool,
     /// Requested time-to-live in seconds, anchored to when the cluster becomes ready (not when
@@ -267,7 +271,84 @@ fn launch_spawn(state: &AppState, cluster: Cluster) {
     });
 }
 
+/// Reads a `multipart/form-data` `POST /clusters` request: a `metadata` part (JSON, same shape
+/// as [`CreateClusterRequest`]) and a `project_tar` part (raw bytes). Both parts are read fully
+/// so oversized uploads are rejected here — via the `max_tar_bytes`-sized `DefaultBodyLimit`
+/// layer on this route (see `http::router`), which surfaces as a multipart read error mid-stream
+/// — rather than passed further into the system.
+///
+/// Nothing downstream yet consumes `project_tar`'s bytes: they're read (so the size limit is
+/// actually enforced) and dropped once this function returns. Extracting and validating the
+/// tar's contents is `SupabaseBackend`'s job, not this HTTP layer's — see `docs/DESIGN.md` §11.
+///
+/// # Arguments
+///
+/// - `multipart`: the incoming multipart body to read.
+///
+/// # Returns
+///
+/// The parsed `metadata` part, once both parts have been read and `service` is confirmed to be
+/// [`ServiceKind::Supabase`] (the only kind this path accepts).
+///
+/// # Errors
+///
+/// [`ApiError::BadRequest`] if a part is missing, the `metadata` part isn't valid JSON matching
+/// [`CreateClusterRequest`], `service` isn't `Supabase`, or the multipart body itself is
+/// malformed or exceeds the configured size limit.
+async fn parse_multipart_create_request(
+    mut multipart: Multipart,
+) -> Result<CreateClusterRequest, ApiError> {
+    let mut metadata: Option<CreateClusterRequest> = None;
+    let mut saw_project_tar = false;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| ApiError::BadRequest(format!("invalid multipart body: {err}")))?
+    {
+        match field.name() {
+            Some("metadata") => {
+                let bytes = field.bytes().await.map_err(|err| {
+                    ApiError::BadRequest(format!("invalid multipart body: {err}"))
+                })?;
+                metadata = Some(serde_json::from_slice(&bytes).map_err(|err| {
+                    ApiError::BadRequest(format!("invalid \"metadata\" part: {err}"))
+                })?);
+            }
+            Some("project_tar") => {
+                field.bytes().await.map_err(|err| {
+                    ApiError::BadRequest(format!("invalid multipart body: {err}"))
+                })?;
+                saw_project_tar = true;
+            }
+            _ => {}
+        }
+    }
+
+    let metadata = metadata.ok_or_else(|| {
+        ApiError::BadRequest("multipart request missing a \"metadata\" part".to_string())
+    })?;
+    if !saw_project_tar {
+        return Err(ApiError::BadRequest(
+            "multipart request missing a \"project_tar\" part".to_string(),
+        ));
+    }
+    if metadata.service != ServiceKind::Supabase {
+        return Err(ApiError::BadRequest(
+            "multipart/form-data requests are only accepted for service \"supabase\"".to_string(),
+        ));
+    }
+
+    Ok(metadata)
+}
+
 /// Validates and accepts a new cluster request, then launches its background provisioning task.
+///
+/// Branches on `Content-Type`: `application/json` is parsed directly as [`CreateClusterRequest`]
+/// and only accepts `ServiceKind::Postgres`; `multipart/form-data` is parsed via
+/// [`parse_multipart_create_request`] (a `metadata` JSON part plus a `project_tar` bytes part)
+/// and only accepts `ServiceKind::Supabase`. Either combination the wrong way round is rejected
+/// with `400`.
 ///
 /// # Arguments
 ///
@@ -275,7 +356,8 @@ fn launch_spawn(state: &AppState, cluster: Cluster) {
 ///   service and background-task dependencies.
 /// - `owner`: the authenticated caller (extracted via [`AuthenticatedClient`]), who will own the
 ///   new cluster.
-/// - `request`: the parsed JSON request body describing the desired service/TTL.
+/// - `request`: the raw incoming request, so this handler can branch on `Content-Type` before
+///   choosing how to parse the body.
 ///
 /// # Returns
 ///
@@ -285,7 +367,8 @@ fn launch_spawn(state: &AppState, cluster: Cluster) {
 ///
 /// # Errors
 ///
-/// [`ApiError::BadRequest`] for an out-of-range `ttl_secs`, plus whatever
+/// [`ApiError::BadRequest`] for an out-of-range `ttl_secs`, a malformed body, or a
+/// `Content-Type`/`service` mismatch, plus whatever
 /// [`crate::service::cluster_service::ClusterService::create`] returns for TTL/quota validation
 /// or storage failures.
 #[utoipa::path(
@@ -294,7 +377,7 @@ fn launch_spawn(state: &AppState, cluster: Cluster) {
     request_body = CreateClusterRequest,
     responses(
         (status = 202, description = "Cluster creation accepted; poll GET /clusters/{id}", body = CreateClusterResponse),
-        (status = 400, description = "TTL out of bounds or unsupported service kind"),
+        (status = 400, description = "TTL out of bounds, unsupported service kind, or Content-Type/service mismatch"),
         (status = 401, description = "Missing or invalid credentials"),
         (status = 429, description = "Owner is already at their cluster quota"),
         (status = 503, description = "Worker pool exhausted or Docker daemon unreachable"),
@@ -303,8 +386,33 @@ fn launch_spawn(state: &AppState, cluster: Cluster) {
 pub async fn create_cluster(
     State(state): State<AppState>,
     AuthenticatedClient(owner): AuthenticatedClient,
-    Json(request): Json<CreateClusterRequest>,
+    request: Request,
 ) -> Result<Response, ApiError> {
+    let is_multipart = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("multipart/form-data"));
+
+    let request = if is_multipart {
+        let multipart = Multipart::from_request(request, &state)
+            .await
+            .map_err(|err| ApiError::BadRequest(format!("invalid multipart body: {err}")))?;
+        parse_multipart_create_request(multipart).await?
+    } else {
+        let Json(body) = Json::<CreateClusterRequest>::from_request(request, &state)
+            .await
+            .map_err(|err| ApiError::BadRequest(format!("invalid JSON body: {err}")))?;
+        if body.service != ServiceKind::Postgres {
+            return Err(ApiError::BadRequest(
+                "service \"supabase\" requires a multipart/form-data request carrying a \
+                 project_tar part"
+                    .to_string(),
+            ));
+        }
+        body
+    };
+
     let ttl = TimeDelta::try_seconds(request.ttl_secs)
         .ok_or_else(|| ApiError::BadRequest("ttl_secs out of range".to_string()))?;
     let service = ServiceSpec {

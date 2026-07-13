@@ -6,7 +6,7 @@ pub mod openapi;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::FromRequestParts;
+use axum::extract::{DefaultBodyLimit, FromRequestParts};
 use axum::http::request::Parts;
 use chrono::TimeDelta;
 use utoipa::OpenApi;
@@ -35,6 +35,10 @@ pub struct AppState {
     /// How long a spawn is expected to take — purely a display hint for `estimated_ready_at`,
     /// not enforced anywhere (the real health-check timeout lives in `PostgresBackend`).
     pub spawn_estimate: TimeDelta,
+    /// The request body size cap applied to `POST /clusters` only (via [`DefaultBodyLimit`] in
+    /// [`router`]), sized to fit a Supabase `project_tar` upload — every other route keeps axum's
+    /// built-in 2MB default.
+    pub max_tar_bytes: usize,
 }
 
 /// Extracts the authenticated caller from `Authorization: Bearer <name>:<secret>`, rejecting
@@ -90,11 +94,14 @@ impl FromRequestParts<AppState> for AuthenticatedClient {
 ///
 /// A fully configured `Router` ready to be served.
 pub fn router(state: AppState) -> Router {
+    let max_tar_bytes = state.max_tar_bytes;
     Router::new()
         .merge(SwaggerUi::new("/").url("/openapi.json", openapi::ApiDoc::openapi()))
         .route(
             "/clusters",
-            axum::routing::post(handlers::create_cluster).get(handlers::list_clusters),
+            axum::routing::post(handlers::create_cluster)
+                .get(handlers::list_clusters)
+                .layer(DefaultBodyLimit::max(max_tar_bytes)),
         )
         .route(
             "/clusters/{id}",

@@ -66,6 +66,10 @@ pub struct LimitsConfig {
     /// How long a `Failed` cluster is kept (so its error is visible via `GET`) before the reaper
     /// deletes it.
     pub failed_cluster_reap_delay_secs: u64,
+    /// The largest `POST /clusters` request body accepted on the `multipart/form-data` path (a
+    /// Supabase `project_tar` upload), in bytes — see [`crate::http::AppState::max_tar_bytes`].
+    /// Every other route keeps axum's built-in 2MB default.
+    pub max_tar_bytes: usize,
 }
 
 /// `[docker]` — how to reach the Docker daemon and what image to run.
@@ -191,6 +195,11 @@ impl Config {
                 "limits.max_clusters_per_user must be at least 1".to_string(),
             ));
         }
+        if self.limits.max_tar_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "limits.max_tar_bytes must be at least 1".to_string(),
+            ));
+        }
         if self.clients.is_empty() {
             return Err(ConfigError::Invalid(
                 "at least one [[clients]] entry is required".to_string(),
@@ -261,6 +270,7 @@ spawn_estimate_secs = 20
 health_check_timeout_secs = 60
 ttl_reaper_interval_secs = 5
 failed_cluster_reap_delay_secs = 5
+max_tar_bytes = 52428800
 
 [docker]
 socket_path = "/var/run/docker.sock"
@@ -317,6 +327,13 @@ unix_user = "openbrain-agent"
     fn rejects_zero_max_clusters_per_user() {
         let toml_str =
             valid_toml().replace("max_clusters_per_user = 2", "max_clusters_per_user = 0");
+        let err = parse(&toml_str).expect_err("invalid");
+        assert!(matches!(err, super::ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn rejects_zero_max_tar_bytes() {
+        let toml_str = valid_toml().replace("max_tar_bytes = 52428800", "max_tar_bytes = 0");
         let err = parse(&toml_str).expect_err("invalid");
         assert!(matches!(err, super::ConfigError::Invalid(_)));
     }
