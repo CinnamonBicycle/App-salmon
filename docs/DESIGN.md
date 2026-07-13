@@ -312,6 +312,12 @@ both are still first-guess values from the original design writeup.
 
 ## 8. Operator prerequisites (stub — full runbook is deferred, §7f)
 
+This section describes running `app_salmon` (and its e2e suite) directly against a host. §8b
+describes an alternative for the e2e suite specifically — `just test-e2e-vm` — that avoids the
+root requirement in the first bullet below entirely, by running it inside a disposable VM
+instead; that's the recommended way to run the e2e suite unless you specifically want it against
+a real host.
+
 - `scripts/setup-e2e-env.sh` (must run as root): creates one Unix account per configured e2e
   client, writes a `/etc/sudoers.d/app-salmon` rule scoped to exactly `mkdir -p <path>` and
   `find <path> -mindepth 1 -delete` against that client's `max_clusters_per_user` literal
@@ -395,9 +401,22 @@ the e2e suite — including a disposable CI runner or a developer's own laptop �
 and the earlier design left no way to run the e2e suite *without* accepting it. `just
 test-e2e-vm` (→ `scripts/vm/run-e2e-in-vm.sh`) closes that gap: it runs the entire e2e suite,
 including `setup-e2e-env.sh` itself, inside an ephemeral QEMU VM booted from a stock Ubuntu cloud
-image, and discards the VM's disk when the run finishes. The invoking host needs QEMU + `/dev/kvm`
-access, but never runs `useradd`, never writes to its own `/etc/sudoers.d`, and never needs a
-Docker daemon of its own.
+image, and discards the VM's disk when the run finishes. **This is now the recommended way to run
+the e2e suite.** The invoking host only ever needs QEMU + `/dev/kvm` access — never runs
+`useradd`, never writes to its own `/etc/sudoers.d`, and never needs a Docker daemon of its own.
+
+**Getting to "QEMU + `/dev/kvm` access" — `just setup-e2e-vm` (→ `scripts/vm/setup-vm-host.sh`):**
+this is the *only* place sudo is needed anywhere in the VM e2e path, and it's a one-time,
+App-Salmon-agnostic setup step, not a per-run or per-project privilege: it installs
+`qemu-system-x86`/`qemu-utils` and a cloud-init seed tool (`cloud-image-utils`) if missing, and
+adds the invoking user to the standard `kvm` group if not already a member (the same group grant
+any KVM user needs on a fresh machine, for any purpose — nothing here is specific to this repo).
+It does not touch `/etc/sudoers.d`, does not create any App-Salmon-specific accounts, and there's
+nothing to uninstall or revert afterwards. If `/dev/kvm` doesn't exist at all, that's a firmware
+(VT-x/AMD-V) or, if the host is itself a VM, a nested-virtualization setting the script can
+detect but not fix from inside the OS — it says so and exits rather than failing confusingly
+later. After it runs (and, if it changed group membership, after logging back in), `just
+test-e2e-vm` itself needs no further privilege at all.
 
 **Design:**
 - `scripts/vm/run-e2e-in-vm.sh` (host side): downloads the official Ubuntu 24.04 (`noble`) server
@@ -467,11 +486,16 @@ directly rather than by inspection:
 What is **not** verified, because it requires either KVM or root this sandbox doesn't have:
 whether the guest actually boots this cloud image under `accel=kvm`, whether cloud-init actually
 runs `write_files`/`runcmd` as configured, whether the 9p mount actually comes up inside the
-guest, whether `apt`/`rustup`/`just test-e2e` actually succeed inside it, and whether
+guest, whether `apt`/`rustup`/`cargo test --test e2e` actually succeed inside it, and whether
 `scripts/setup-e2e-env.sh` behaves the same inside this specific cloud image as it does on a bare
-host. The first session with real `/dev/kvm` access should run `just test-e2e-vm` against a
-scratch checkout and treat whatever it finds as a bug report against this section — same posture
-already established for the e2e suite itself in §8a.
+host. `scripts/vm/setup-vm-host.sh` itself is equally unverified end-to-end for the same reason —
+its `apt-get install`/`usermod` steps were checked only for correct package names and syntax
+(`apt-cache policy qemu-system-x86 qemu-utils cloud-image-utils`, `bash -n`, and the `kvm`-group
+membership-detection logic exercised directly against this sandbox's real `/etc/group`), not run
+for real, since doing so would modify this sandbox's host. The first session with real `/dev/kvm`
+access should run `just setup-e2e-vm && just test-e2e-vm` against a scratch checkout and treat
+whatever it finds as a bug report against this section — same posture already established for the
+e2e suite itself in §8a.
 
 ## 9. Testing & coverage
 
@@ -482,9 +506,12 @@ already established for the e2e suite itself in §8a.
   to leave e2e unrun, not to fail).
 - `just test-unit` / `just test-e2e` / `just test-all` — independently runnable, per the
   requirement that unit and e2e stay separable.
-- `just test-e2e-vm` — runs the same e2e suite inside a disposable QEMU VM instead of on this
-  machine, so `setup-e2e-env.sh`'s host-level changes never touch the machine actually running the
-  tooling; see §8b for the design and its verification status.
+- `just setup-e2e-vm` / `just test-e2e-vm` (recommended over `setup-e2e`/`test-e2e`) — runs the
+  same e2e suite inside a disposable QEMU VM instead of on this machine, so
+  `setup-e2e-env.sh`'s host-level changes never touch the machine actually running the tooling;
+  this machine only needs QEMU + `/dev/kvm` access, which `setup-e2e-vm` gets for you (sudo used
+  once, for two generic non-App-Salmon-specific things). See §8b for the design and its
+  verification status.
 - `just coverage` (needs `cargo install cargo-llvm-cov` + `rustup component add
   llvm-tools-preview` once per machine) — measures the **entire** `--lib` target, no
   `--ignore-filename-regex` carve-out for adapters. Current state (2026-07-12): 96.2% region /

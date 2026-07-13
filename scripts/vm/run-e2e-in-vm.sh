@@ -4,17 +4,17 @@
 # Docker daemon — land on a throwaway guest instead of this host. See docs/DESIGN.md, "VM e2e
 # testing" section.
 #
-# Host requirements:
-#   - qemu-system-x86_64 + qemu-img, with this user able to read/write /dev/kvm (member of
-#     the `kvm` group, or equivalent) — one level of hardware virtualization is enough; the
-#     e2e suite runs plain Docker (runc) inside the guest, not a nested hypervisor.
-#   - one of cloud-localds, genisoimage, mkisofs, xorriso, to build the cloud-init seed image.
-#   - network access, to fetch the base Ubuntu cloud image once (cached under
-#     ~/.cache/app-salmon-e2e-vm/ afterwards; verified against the vendor's published
-#     SHA256SUMS on every run, not just the first).
-# Explicitly NOT required on this host: root, a Docker daemon, or any of the useradd/sudoers
-# changes scripts/setup-e2e-env.sh makes — all of that happens only inside the disposable
-# guest, which is discarded when this script exits.
+# Host requirements: qemu-system-x86_64 + qemu-img, a cloud-init seed-image tool (cloud-localds,
+# genisoimage, mkisofs, or xorriso), this user able to read/write /dev/kvm, and network access to
+# fetch the base Ubuntu cloud image once. Run `./scripts/vm/setup-vm-host.sh` once per machine to
+# get all of that — it's the *only* place sudo is needed for this path, for two ordinary,
+# App-Salmon-agnostic, one-time things (installing qemu, adding you to the `kvm` group), not
+# anything specific to this project or repeated per run.
+#
+# Explicitly NOT required on this host, at all: root, a Docker daemon, or any of the
+# useradd/sudoers changes scripts/setup-e2e-env.sh makes — all of that happens only inside the
+# disposable guest, which is discarded when this script exits. This is the whole point of this
+# script over running `scripts/setup-e2e-env.sh` + `just test-e2e` directly.
 #
 # Usage: scripts/vm/run-e2e-in-vm.sh [--keep] [--timeout SECONDS]
 #   --keep      don't delete the overlay disk / seed image on exit (inspect after a failure)
@@ -59,16 +59,19 @@ done
 
 echo "== checking host prerequisites =="
 command -v qemu-system-x86_64 >/dev/null 2>&1 || {
-	echo "qemu-system-x86_64 not found; install qemu-system-x86" >&2
+	echo "qemu-system-x86_64 not found." >&2
+	echo "  run: ./scripts/vm/setup-vm-host.sh  (one-time; installs qemu, no other host changes)" >&2
 	exit 1
 }
 command -v qemu-img >/dev/null 2>&1 || {
-	echo "qemu-img not found; install qemu-utils" >&2
+	echo "qemu-img not found." >&2
+	echo "  run: ./scripts/vm/setup-vm-host.sh  (one-time; installs qemu, no other host changes)" >&2
 	exit 1
 }
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || {
 	echo "/dev/kvm not accessible by this user." >&2
-	echo "  sudo usermod -aG kvm \$USER, then log out and back in, and retry." >&2
+	echo "  run: ./scripts/vm/setup-vm-host.sh  (one-time; adds you to the kvm group, nothing" >&2
+	echo "  else — you'll need to log out and back in afterwards for it to take effect)." >&2
 	exit 1
 }
 
@@ -81,7 +84,7 @@ for candidate in cloud-localds genisoimage mkisofs xorriso; do
 done
 [ -n "$SEED_TOOL" ] || {
 	echo "none of cloud-localds/genisoimage/mkisofs/xorriso found." >&2
-	echo "  install one, e.g.: sudo apt-get install cloud-image-utils" >&2
+	echo "  run: ./scripts/vm/setup-vm-host.sh  (one-time; installs cloud-image-utils)" >&2
 	exit 1
 }
 echo "  ok (seed tool: $SEED_TOOL)"

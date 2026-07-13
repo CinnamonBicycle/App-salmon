@@ -12,11 +12,15 @@ the OpenRouter proxy, edge-function sandboxing, and TLS are deferred — see
 ## Quick start
 
 ```sh
-just ci          # fmt-check, clippy, unit tests, and e2e if this machine is set up for it
-just test-unit   # unit tests only — no Docker/sudo/root required
-just setup-e2e   # one-time, needs root: provisions worker accounts + sudoers rule + pulls the image
-just test-e2e    # e2e suite against real Docker/sudo/Postgres
-just run         # cargo run -- --config config.toml
+just ci             # fmt-check, clippy, unit tests, and e2e if this machine is set up for it
+just test-unit      # unit tests only — no Docker/sudo/root required
+
+# e2e suite, recommended path — runs in a disposable VM, no root/Docker on this host:
+just setup-e2e-vm   # one-time: installs QEMU + adds you to the kvm group if needed (needs sudo
+                     # only for those two ordinary, generic, one-time things — see below)
+just test-e2e-vm    # runs the full e2e suite inside an ephemeral QEMU VM
+
+just run            # cargo run -- --config config.toml
 ```
 
 See `just --list` for everything else, and `docs/DESIGN.md` for the config file shape.
@@ -33,10 +37,12 @@ Requires `cargo`/`rustc` (stable) and [`just`](https://github.com/casey/just) on
 
 | Command | What it does | Needs |
 |---|---|---|
-| `just ci` | Everything below, in order — the full gate | Docker+root optional (e2e step self-skips with instructions if absent) |
+| `just ci` | Everything below, in order — the full gate | e2e step self-skips with instructions if neither e2e path is set up |
 | `just test-unit` | `cargo test --lib` — all unit tests | Nothing special |
-| `just setup-e2e` | Provisions worker accounts, a scoped `sudoers.d` rule, and pulls the Postgres image | Root, one-time per machine |
-| `just test-e2e` | `cargo test --test e2e` against real Docker/sudo/Postgres | `just setup-e2e` having been run |
+| `just setup-e2e-vm` | Installs QEMU + adds you to the `kvm` group if needed | sudo, one-time, for two generic non-App-Salmon-specific things |
+| `just test-e2e-vm` | Runs the e2e suite inside a disposable QEMU VM | `just setup-e2e-vm` having been run; **no root/Docker on this host** |
+| `just setup-e2e` | Provisions worker accounts + a scoped `sudoers.d` rule directly on this host | Root, one-time, persists App-Salmon-specific system state |
+| `just test-e2e` | `cargo test --test e2e` against Docker/sudo/Postgres running directly on this host | `just setup-e2e` having been run |
 | `just test-all` | `test-unit` + `test-e2e` back to back | Same as `test-e2e` |
 | `just coverage` | `cargo llvm-cov --lib` summary | `cargo install cargo-llvm-cov` + `rustup component add llvm-tools-preview` once |
 | `just coverage-html` | Same, as a browsable HTML report at `target/llvm-cov/html/index.html` | Same as `coverage` |
@@ -46,9 +52,20 @@ Requires `cargo`/`rustc` (stable) and [`just`](https://github.com/casey/just) on
 **Why the e2e split matters:** unit tests (`just test-unit`) run against fakes for every external
 system (a fake Docker Engine API server, a fake `sudo` script, an in-memory or real-file SQLite
 DB) and need no privileges at all — anyone can run them, including in CI or a sandboxed session.
-The e2e suite (`just test-e2e`) is the only thing that verifies the real adapters against a real
-Docker daemon, real `sudo`, and a real Postgres container, and it genuinely needs root (to
-provision worker accounts and the sudoers rule) plus a running Docker daemon — it cannot run in
-every environment. Anyone with an environment that has both should run `just setup-e2e` once and
-then `just test-e2e` (or just `just ci`) themselves, rather than relying on e2e-only code paths
-being exercised for the first time only after a commit and push.
+The e2e suite is the only thing that verifies the real adapters against a real Docker daemon,
+real `sudo`, and a real Postgres container, and needs somewhere real to run those — it cannot run
+in every environment. **There are two ways to give it that:**
+- **`just test-e2e-vm` (recommended):** runs the whole suite, including provisioning the
+  App-Salmon-specific worker accounts and sudoers rule, inside a disposable QEMU VM. This host
+  only ever needs `/dev/kvm` access — `just setup-e2e-vm` gets you that with sudo used just once,
+  for installing QEMU and joining the standard `kvm` group, the same one-time step any KVM user
+  needs on a fresh machine. Nothing App-Salmon-specific touches this host; the VM's disk (and
+  everything provisioned inside it) is discarded when the run finishes.
+- **`just test-e2e` (direct):** runs against Docker/sudo/Postgres on this host directly. Needs
+  root to provision worker accounts and a sudoers rule (`just setup-e2e`), and those persist on
+  this host afterwards. Useful if you don't want or can't get KVM access, or specifically want to
+  exercise the real host path.
+
+Either way, run it yourself (`just test-e2e-vm` or `just setup-e2e && just test-e2e`, or just
+`just ci`) rather than relying on e2e-only code paths being exercised for the first time only
+after a commit and push.

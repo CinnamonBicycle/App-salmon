@@ -10,7 +10,9 @@ ci: fmt-check lint test-unit
         just test-e2e
     else
         echo "e2e prerequisites not detected (docker reachable + e2e-agent account provisioned)."
-        echo "Run 'sudo ./scripts/setup-e2e-env.sh' then 'just test-e2e' to run the full suite."
+        echo "Two ways to run it:"
+        echo "  just setup-e2e-vm && just test-e2e-vm   (no root needed beyond a one-time KVM group grant)"
+        echo "  sudo ./scripts/setup-e2e-env.sh && just test-e2e   (root, persists e2e system accounts)"
     fi
 
 # Format the whole workspace.
@@ -54,14 +56,25 @@ coverage-html:
 run config="config.toml":
     cargo run -- --config {{ config }}
 
-# One-time setup for running the e2e suite on this machine (worker accounts, sudoers rule,
-# postgres image). Needs root.
+# One-time setup for running the e2e suite directly on this machine (worker accounts, sudoers
+# rule, postgres image). Needs root, and persists App-Salmon-specific system accounts and a
+# sudoers rule on this machine for as long as you keep them. Prefer `just setup-e2e-vm` +
+# `just test-e2e-vm` unless you specifically want the suite to run against this host directly.
 setup-e2e:
     sudo ./scripts/setup-e2e-env.sh
 
+# One-time setup for running the e2e suite inside a disposable VM instead (see test-e2e-vm below):
+# installs QEMU if missing and adds you to the `kvm` group if needed. Needs sudo only for those
+# two ordinary, generic, one-time things — nothing App-Salmon-specific, nothing that persists
+# beyond "this machine can run QEMU with KVM acceleration", which most dev machines want anyway.
+# Log out and back in after running this if it added you to the kvm group.
+setup-e2e-vm:
+    ./scripts/vm/setup-vm-host.sh
+
 # Run the e2e suite inside an ephemeral, disposable QEMU VM instead of on this machine directly
 # — so setup-e2e's useradd/sudoers.d writes and the e2e suite's Docker usage land on a throwaway
-# guest, not here. Needs QEMU + KVM access (see scripts/vm/run-e2e-in-vm.sh's header for exact
-# host prerequisites); does NOT need root, Docker, or setup-e2e to have been run on this machine.
+# guest, not here. Needs `just setup-e2e-vm` to have been run once; does NOT need root, Docker,
+# or scripts/setup-e2e-env.sh to have been run on this machine — this is the recommended way to
+# run the e2e suite unless you have a specific reason to run it against this host directly.
 test-e2e-vm *args:
     ./scripts/vm/run-e2e-in-vm.sh {{ args }}
