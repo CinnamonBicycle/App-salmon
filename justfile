@@ -4,9 +4,9 @@
 # Run everything CI checks: formatting, lint, unit coverage, and e2e if this machine is set up
 # for it (never silently skipped — see `test-e2e`). Prefers, in order: a persistent e2e VM
 # already up (fast — no boot/provision cost per run), then the bare-host setup, then a reminder
-# covering every option if neither is available. Deliberately does NOT boot an ephemeral VM
-# itself (`test-e2e-vm`) — that's a multi-minute image-download-and-boot cost, too heavy for a
-# gate you might run many times while iterating; that path stays opt-in.
+# covering every option if neither is available. Deliberately does NOT boot a VM itself — that's
+# a multi-minute image-download-and-boot cost, too heavy for a gate you might run many times
+# while iterating; `just e2e-vm-up` stays a separate, deliberate step.
 ci: fmt-check lint test-unit
     #!/usr/bin/env bash
     set -euo pipefail
@@ -17,8 +17,7 @@ ci: fmt-check lint test-unit
     else
         echo "e2e prerequisites not detected (no persistent e2e VM up, and no bare-host docker +"
         echo "e2e-agent account). Options, in order of preference:"
-        echo "  just e2e-vm-up && just ci                         (persistent VM, reused across runs)"
-        echo "  just setup-e2e-vm && just test-e2e-vm             (one-shot disposable VM)"
+        echo "  just setup-e2e-vm && just e2e-vm-up && just ci    (persistent VM, reused across runs)"
         echo "  sudo ./scripts/setup-e2e-env.sh && just test-e2e  (root, persists e2e system accounts)"
     fi
 
@@ -66,11 +65,12 @@ run config="config.toml":
 # One-time setup for running the e2e suite directly on this machine (worker accounts, sudoers
 # rule, postgres image). Needs root, and persists App-Salmon-specific system accounts and a
 # sudoers rule on this machine for as long as you keep them. Prefer `just setup-e2e-vm` +
-# `just test-e2e-vm` unless you specifically want the suite to run against this host directly.
+# `just e2e-vm-up` + `just e2e-vm-test` unless you specifically want the suite to run against
+# this host directly.
 setup-e2e:
     sudo ./scripts/setup-e2e-env.sh
 
-# One-time setup for running the e2e suite inside a disposable VM instead (see test-e2e-vm below):
+# One-time setup for running the e2e suite inside a disposable VM instead (see e2e-vm-up below):
 # installs QEMU if missing and adds you to the `kvm` group if needed. Needs sudo only for those
 # two ordinary, generic, one-time things — nothing App-Salmon-specific, nothing that persists
 # beyond "this machine can run QEMU with KVM acceleration", which most dev machines want anyway.
@@ -78,20 +78,12 @@ setup-e2e:
 setup-e2e-vm:
     ./scripts/vm/setup-vm-host.sh
 
-# Run the e2e suite inside an ephemeral, disposable QEMU VM instead of on this machine directly
-# — so setup-e2e's useradd/sudoers.d writes and the e2e suite's Docker usage land on a throwaway
-# guest, not here. Needs `just setup-e2e-vm` to have been run once; does NOT need root, Docker,
-# or scripts/setup-e2e-env.sh to have been run on this machine. Boots, provisions, tests, and
-# discards the VM every single call — prefer `just e2e-vm-up` + `just e2e-vm-test` if you're
-# going to run the suite more than once in a session, which skips the repeated boot/provision
-# cost this pays every time.
-test-e2e-vm *args:
-    ./scripts/vm/run-e2e-in-vm.sh {{ args }}
-
-# Boot a persistent e2e VM that stays up across multiple test runs — unlike test-e2e-vm, which
-# boots, tests, and discards on every call. Idempotent (safe to run if already up). Needs
-# `just setup-e2e-vm` to have been run once. Run this once per session, then `just e2e-vm-test`
-# (or just `just ci`) as many times as you like, then `just e2e-vm-down` when done.
+# Boot a persistent e2e VM that stays up across multiple test runs. Idempotent (safe to run if
+# already up). Needs `just setup-e2e-vm` to have been run once. Run this once per session, then
+# `just e2e-vm-test` (or just `just ci`) as many times as you like, then `just e2e-vm-down` when
+# done. This is the only VM-based e2e path — there used to be a one-shot boot/test/discard
+# variant, but it had a permission bug in its 9p-based repo-sharing that duplicated
+# `vm_sync_repo`'s job to fix properly, so it was removed rather than fixed twice.
 e2e-vm-up:
     ./scripts/vm/e2e-vm-up.sh
 

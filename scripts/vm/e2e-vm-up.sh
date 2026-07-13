@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
 # Boots a persistent, disposable QEMU VM for running the e2e suite against repeatedly within a
-# session, without paying full boot+provision cost on every run — unlike
-# scripts/vm/run-e2e-in-vm.sh, which boots, provisions, runs the suite once, and discards the VM
-# every single invocation. Idempotent: if a healthy instance is already up, does nothing and
-# reports it.
+# session, without paying full boot+provision cost on every run. Idempotent: if a healthy
+# instance is already up, does nothing and reports it. This is the only VM-based e2e path — an
+# earlier one-shot boot/test/discard variant (run-e2e-in-vm.sh) was removed after it turned out
+# to have the same 9p-permission bug this script's own history fixed (see below), and fixing it
+# there too would have meant re-deriving a synchronous SSH channel it was never designed to have.
 #
-# Host requirements and the *only* place sudo is needed: same as run-e2e-in-vm.sh — see
-# scripts/vm/setup-vm-host.sh (`just setup-e2e-vm`).
+# Host requirements and the *only* place sudo is needed: scripts/vm/setup-vm-host.sh
+# (`just setup-e2e-vm`).
 #
 # Usage: scripts/vm/e2e-vm-up.sh
 # Then:  scripts/vm/e2e-vm-run-tests.sh   (repeatedly, as often as you like)
 #        scripts/vm/e2e-vm-down.sh        (when done — wipes the VM's disk)
 #
-# Status: boot-verified for real against a real KVM host (2026-07-13) — boot, cloud-init's
-# write_files/ssh_authorized_keys/host-key injection, and SSH all confirmed working. That first
-# real run also found a real bug: a live 9p share (security_model=none) passes the host's raw
-# uid/gid/mode through to the guest, so a non-root guest user without a matching uid gets locked
-# out of a normal-permission host checkout. Fixed by dropping the 9p share entirely in favor of
-# copying the repo in over the same SSH channel (see lib.sh's vm_sync_repo) — not yet re-verified
-# against real KVM since that fix (the qemu flags/cloud-init schema themselves are otherwise
-# unchanged from the verified boot). See docs/DESIGN.md §8c.
+# Status: boot-verified end to end for real against a real KVM host, across two runs
+# (2026-07-13). Run 1 confirmed boot, cloud-init's write_files/ssh_authorized_keys/host-key
+# injection, and SSH all working, and also found a real bug: a live 9p share
+# (security_model=none) passes the host's raw uid/gid/mode through to the guest, so a non-root
+# guest user without a matching uid gets locked out of a normal-permission host checkout. Fixed
+# by dropping the 9p share entirely in favor of copying the repo in over the same SSH channel
+# (see lib.sh's vm_sync_repo). Run 2, after that fix: full up → sync → provision → e2e cycle
+# completed cleanly, all 18 e2e tests passing. See docs/DESIGN.md §8c.
 
 set -euo pipefail
 

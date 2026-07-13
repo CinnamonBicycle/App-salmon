@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time helper to get this host ready to run `just test-e2e-vm`.
+# One-time helper to get this host ready to run `just e2e-vm-up`.
 #
 # Unlike scripts/setup-e2e-env.sh (which provisions long-lived, App-Salmon-specific system
 # accounts and a sudoers rule, needed again on every machine that runs the bare-host e2e path),
@@ -13,7 +13,7 @@
 # this as your normal user, not as root. Safe to re-run: every step checks current state first.
 #
 # After this script adds you to the kvm group, log out and back in (or run `newgrp kvm` in your
-# current shell) before running `just test-e2e-vm` — group membership changes don't apply to
+# current shell) before running `just e2e-vm-up` — group membership changes don't apply to
 # already-running sessions.
 #
 # Debian/Ubuntu-specific (uses apt-get), matching this repo's existing assumption elsewhere
@@ -60,12 +60,12 @@ elif [ ! -e /dev/kvm ]; then
 	exit 1
 elif getent group kvm >/dev/null 2>&1 && getent group kvm | cut -d: -f4 | tr ',' '\n' | grep -qx "$(whoami)"; then
 	echo "  you're already in the kvm group (per /etc/group), but this shell session predates"
-	echo "  that — run 'newgrp kvm', or log out and back in, then re-run 'just test-e2e-vm'."
+	echo "  that — run 'newgrp kvm', or log out and back in, then re-run 'just e2e-vm-up'."
 else
 	echo "  adding $(whoami) to the kvm group (needs sudo, one-time)"
 	sudo usermod -aG kvm "$(whoami)"
 	echo "  done. Log out and back in (or run 'newgrp kvm' in this shell) for it to take"
-	echo "  effect, then run 'just test-e2e-vm'."
+	echo "  effect, then run 'just e2e-vm-up'."
 fi
 
 echo "== done =="

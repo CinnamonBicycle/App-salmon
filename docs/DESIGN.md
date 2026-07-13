@@ -312,11 +312,11 @@ both are still first-guess values from the original design writeup.
 
 ## 8. Operator prerequisites (stub — full runbook is deferred, §7f)
 
-This section describes running `app_salmon` (and its e2e suite) directly against a host. §8b
-describes an alternative for the e2e suite specifically — `just test-e2e-vm` — that avoids the
-root requirement in the first bullet below entirely, by running it inside a disposable VM
-instead; that's the recommended way to run the e2e suite unless you specifically want it against
-a real host.
+This section describes running `app_salmon` (and its e2e suite) directly against a host. §8c
+describes an alternative for the e2e suite specifically — `just e2e-vm-up` / `e2e-vm-test` — that
+avoids the root requirement in the first bullet below entirely, by running it inside a disposable
+VM instead; that's the recommended way to run the e2e suite unless you specifically want it
+against a real host.
 
 - `scripts/setup-e2e-env.sh` (must run as root): creates one Unix account per configured e2e
   client, writes a `/etc/sudoers.d/app-salmon` rule scoped to exactly `mkdir -p <path>` and
@@ -386,131 +386,31 @@ kept in sync by hand:**
   row. Not fixed here (no reproduction, no test infrastructure currently writes corrupt rows) —
   flagged for awareness, not treated as a phase-1 blocker.
 
-## 8b. VM e2e testing — `just test-e2e-vm`
+## 8b. Removed: one-shot ephemeral VM e2e testing (`test-e2e-vm`)
 
-`scripts/setup-e2e-env.sh` (per §8) makes real, host-level changes: it creates system Unix
-accounts and writes an `/etc/sudoers.d` rule. Requiring that on every machine that wants to run
-the e2e suite — including a disposable CI runner or a developer's own laptop — is a real cost,
-and the earlier design left no way to run the e2e suite *without* accepting it. `just
-test-e2e-vm` (→ `scripts/vm/run-e2e-in-vm.sh`) closes that gap: it runs the entire e2e suite,
-including `setup-e2e-env.sh` itself, inside an ephemeral QEMU VM booted from a stock Ubuntu cloud
-image, and discards the VM's disk when the run finishes. The invoking host only ever needs QEMU +
-`/dev/kvm` access — never runs `useradd`, never writes to its own `/etc/sudoers.d`, and never
-needs a Docker daemon of its own.
-
-**Known, unfixed bug, found via §8c — do not treat this path as verified until it's fixed here
-too.** `run-e2e-in-vm.sh`/`guest-init.sh` use the same `-virtfs local,...,security_model=none` 9p
-share and the same `su - ubuntu -c "cd $REPO && ..."` pattern that §8c's first real KVM run
-found broken: `security_model=none` passes the host's raw uid/gid/mode through to the guest, so a
-non-root guest user without a numerically matching uid gets `Permission denied` on the shared
-`/repo` — root bypasses the check (which is why the `setup-e2e-env.sh` step, run via `sudo`,
-would still work), but the actual `cargo test --test e2e` step, run as plain `ubuntu`, would not.
-This has not yet been fixed here the way §8c was (copying the repo in over a channel instead of a
-live share) because this path has no SSH/synchronous channel to reuse — it's a fire-and-forget
-cloud-init script with no interactive session, so the same fix would need a different mechanism.
-Prefer `just e2e-vm-up`/`e2e-vm-test` (§8c) until this is addressed.
-
-**Getting to "QEMU + `/dev/kvm` access" — `just setup-e2e-vm` (→ `scripts/vm/setup-vm-host.sh`):**
-this is the *only* place sudo is needed anywhere in the VM e2e path, and it's a one-time,
-App-Salmon-agnostic setup step, not a per-run or per-project privilege: it installs
-`qemu-system-x86`/`qemu-utils` and a cloud-init seed tool (`cloud-image-utils`) if missing, and
-adds the invoking user to the standard `kvm` group if not already a member (the same group grant
-any KVM user needs on a fresh machine, for any purpose — nothing here is specific to this repo).
-It does not touch `/etc/sudoers.d`, does not create any App-Salmon-specific accounts, and there's
-nothing to uninstall or revert afterwards. If `/dev/kvm` doesn't exist at all, that's a firmware
-(VT-x/AMD-V) or, if the host is itself a VM, a nested-virtualization setting the script can
-detect but not fix from inside the OS — it says so and exits rather than failing confusingly
-later. After it runs (and, if it changed group membership, after logging back in), `just
-test-e2e-vm` itself needs no further privilege at all.
-
-**Design:**
-- `scripts/vm/run-e2e-in-vm.sh` (host side): downloads the official Ubuntu 24.04 (`noble`) server
-  cloud image once, caches it under `~/.cache/app-salmon-e2e-vm/`, and **re-verifies its SHA-256
-  against the vendor's published `SHA256SUMS` on every run** (not a checksum hardcoded once in
-  this script, which would silently go stale as Ubuntu republishes the `current` image) —
-  redownloads once and re-checks if the cached copy ever fails to match. Creates a copy-on-write
-  qcow2 overlay backed by that cached image (`qemu-img create -f qcow2 -F qcow2 -b <base>
-  overlay.qcow2 20G`) so the cached base image itself is never written to. Builds a `cidata`
-  (NoCloud) cloud-init seed ISO via whichever of `cloud-localds` / `genisoimage` / `mkisofs` /
-  `xorriso -as genisoimage` is on `PATH`. Boots with `-machine q35,accel=kvm -cpu host`, a
-  `virtio-net` user-mode NIC (outbound only, for `apt`/`docker pull`/`rustup`), and a `-virtfs
-  local` 9p share exposing the repo checkout read-write at `/repo` inside the guest — the same
-  checkout the host is running from, not a copy. Waits on the qemu process under a `timeout`
-  (default 1800s), then reads the guest's result back from `<repo>/.e2e-vm-result/` (which is
-  simply a subdirectory of the same 9p share, so both sides see it without any extra transport).
-- `scripts/vm/guest-init.sh` (guest side, run as root via cloud-init `runcmd`): mounts the 9p
-  share at `/repo`, installs `docker.io` and a build toolchain via `apt`, installs Rust via
-  `rustup` for the cloud image's default `ubuntu` user, runs `APP_SALMON_USER=ubuntu
-  scripts/setup-e2e-env.sh` — so the invasive host changes §8 describes land on *this disposable
-  guest*, exactly once, and are thrown away with the VM's disk — then runs `cargo test --test
-  e2e -- --test-threads=1` as `ubuntu` (the same command `just test-e2e` runs; called directly
-  here rather than through `just` itself, since `just` isn't guaranteed present in every Ubuntu
-  release's default repos and this is the one place avoiding that dependency was worth the small
-  duplication), and writes its exit code and full test log to `/repo/.e2e-vm-result/`. An
-  `EXIT` trap guarantees the guest always powers off and always leaves an `exit_code` file
-  behind, however the script exits — including a failure before the test run even starts (a bad
-  apt mirror, a rustup network hiccup, the 9p mount itself) — specifically so a pre-test failure
-  surfaces as "failed in a couple of minutes with a log to read" on the host side rather than
-  "the host blocks for the full `--timeout` with no explanation." The VM's own poweroff is what
-  makes the host's `qemu-system-x86_64` process exit and the host script proceed to read the
-  result.
-- **Why not nested virtualization:** phase-1 e2e only needs plain Docker (runc containers, i.e.
-  Linux namespaces + cgroups in the guest kernel) — one level of hardware virtualization
-  (`-enable-kvm`/`accel=kvm`) is sufficient and is all this tooling requires or configures.
-  Nested virtualization (`kvm_intel`/`kvm_amd`'s `nested=1` module parameter) only becomes
-  necessary once the *guest itself* needs to run a second-level hypervisor — that's the
-  Kata-Containers phase (§7c), not this one. Building today's tooling to require nested virt now
-  would make it fail on hosts that don't have that host-kernel module setting even though nothing
-  it currently runs needs it; the same QEMU invocation carries forward unchanged into the Kata
-  phase, at which point only a host-side module flag changes, not this script.
-
-**Verification status — read before trusting this beyond "the pieces are individually sound":**
-this sandbox has no `/dev/kvm` access (confirmed: this user isn't in the `kvm` group, a direct
-open of `/dev/kvm` is denied, and there's no passwordless sudo available to fix either) — so
-**no VM has actually been booted in any session so far.** What *was* verified in this sandbox,
-directly rather than by inspection:
-- Both scripts are `bash -n`-clean.
-- The generated cloud-init `user-data`/`meta-data` were parsed with a real YAML parser
-  (`python3` + `PyYAML`), including base64-decoding the embedded `guest-init.sh` and confirming
-  it round-trips byte-for-byte.
-- Every QEMU flag used (`-machine q35,accel=kvm|tcg`, `-cpu`, `-smp`, `-no-reboot`, `-display
-  none`, `-serial file:...`, `-drive ...,if=virtio`, `-netdev user` + `virtio-net-pci`, `-virtfs
-  local,...,security_model=none`) was checked against this machine's actual `qemu-system-x86_64
-  --help` / `-device help` / `-accel help` output, and **the exact command line this script
-  builds was run against real (throwaway) disk/ISO files**, with `accel=tcg` substituted for
-  `accel=kvm` and `-cpu qemu64` substituted for `-cpu host` (both real-run values require KVM,
-  which this sandbox doesn't have) — every other flag was passed through unchanged, and QEMU
-  accepted the full command line and started successfully before being killed. `accel=kvm` and
-  `-cpu host` themselves were not, and could not be, exercised here.
-- `qemu-img create -f qcow2 -F qcow2 -b <base> <overlay> 20G` was run for real against a scratch
-  backing file and produces a correctly-sized, correctly-backed overlay (`qemu-img info`
-  confirms `backing file`/`backing file format`/`virtual size`).
-- The base image URL and its `SHA256SUMS` companion were fetched for real from
-  `cloud-images.ubuntu.com` in this sandbox and do resolve/match as this script expects.
-
-What is **not** verified, because it requires either KVM or root this sandbox doesn't have:
-whether the guest actually boots this cloud image under `accel=kvm`, whether cloud-init actually
-runs `write_files`/`runcmd` as configured, whether the 9p mount actually comes up inside the
-guest, whether `apt`/`rustup`/`cargo test --test e2e` actually succeed inside it, and whether
-`scripts/setup-e2e-env.sh` behaves the same inside this specific cloud image as it does on a bare
-host. `scripts/vm/setup-vm-host.sh` itself is equally unverified end-to-end for the same reason —
-its `apt-get install`/`usermod` steps were checked only for correct package names and syntax
-(`apt-cache policy qemu-system-x86 qemu-utils cloud-image-utils`, `bash -n`, and the `kvm`-group
-membership-detection logic exercised directly against this sandbox's real `/etc/group`), not run
-for real, since doing so would modify this sandbox's host. The first session with real `/dev/kvm`
-access should run `just setup-e2e-vm && just test-e2e-vm` against a scratch checkout and treat
-whatever it finds as a bug report against this section — same posture already established for the
-e2e suite itself in §8a.
+An earlier version of this section described `just test-e2e-vm` (→ `scripts/vm/run-e2e-in-vm.sh`
++ `scripts/vm/guest-init.sh`): boot, provision, run the e2e suite, and discard a VM in one
+fire-and-forget cloud-init script, no interactive session with the guest at any point. It used
+the same `-virtfs local,...,security_model=none` 9p share §8c's persistent VM originally used —
+and hit the identical bug (§8c, and §8a's now-resolved arbitrary-uid entry): `security_model=none`
+passes the host's raw uid/gid/mode through to the guest, so the non-root `ubuntu` user running the
+actual test suite got `Permission denied` on the shared `/repo`, confirmed on a real KVM run
+(2026-07-13). §8c's fix was to copy the repo in over SSH instead of sharing it live — but this
+one-shot path has no SSH or other synchronous channel to the guest to reuse for that fix; adding
+one would mean redesigning it to look like §8c's `up`/`test`/`down` composed together, at which
+point there was no reason to keep it as a second, separately-maintained implementation of the same
+idea. **Removed rather than fixed twice.** `just e2e-vm-up` / `e2e-vm-test` / `e2e-vm-down` (§8c)
+is now the only VM-based e2e path.
 
 ## 8c. Persistent VM for iterative testing — `just e2e-vm-up` / `e2e-vm-test` / `e2e-vm-down`
 
-`test-e2e-vm` (§8b) boots, provisions, and discards a VM on every single call — correct for a
-one-shot run, expensive if you're iterating on e2e-suite-relevant code and want to run it
-repeatedly in one sitting. `just e2e-vm-up` boots a VM once and leaves it running; `just
-e2e-vm-test` (which `just ci` also uses automatically when such a VM is up — see below) runs the
-suite against it over SSH in a few seconds instead of minutes; `just e2e-vm-down` tears it down
-and wipes its disk. Same host prerequisites as §8b (`just setup-e2e-vm`), same "only sudo used
-is the one-time KVM group grant" property.
+This is the VM-based e2e path — the only one (§8b describes an earlier one-shot variant, removed
+after this section's first real run found the bug described below and fixing it here turned out
+to make the one-shot variant redundant). `just e2e-vm-up` boots a VM once and leaves it running;
+`just e2e-vm-test` (which `just ci` also uses automatically when such a VM is up — see below) runs
+the suite against it over SSH in a few seconds instead of minutes once it's up; `just e2e-vm-down`
+tears it down and wipes its disk. Host prerequisites: `just setup-e2e-vm` — the *only* sudo used
+anywhere in this path, a one-time KVM group grant.
 
 **How `just ci` finds it:** `ci`'s e2e step runs `scripts/vm/e2e-vm-status.sh` first (silently);
 if that reports the persistent VM up, `ci` runs the suite against it (`just e2e-vm-test`) instead
@@ -520,8 +420,8 @@ neither the persistent VM nor the bare-host setup is available, `ci` prints all 
 (persistent VM, one-shot VM, bare host) so the omission is never silent.
 
 **Design:**
-- `scripts/vm/lib.sh`: helpers shared with `run-e2e-in-vm.sh` (host-prereq checks, base-image
-  download+verify, seed-ISO building) plus persistent-VM-specific ones: `vm_find_free_port`
+- `scripts/vm/lib.sh`: host-prereq checks, base-image download+verify, and seed-ISO building,
+  plus persistent-VM-specific helpers: `vm_find_free_port`
   (asks the OS for a free `127.0.0.1` port via a throwaway Python socket bind — a small, accepted
   TOCTOU race for a local single-user dev tool), `vm_pid_is_our_qemu` (checks `/proc/<pid>/cmdline`
   contains both `qemu-system-x86_64` and a marker — the overlay disk's path — so a stale pidfile
@@ -537,8 +437,9 @@ neither the persistent VM nor the bare-host setup is available, `ci` prints all 
   instance `provisioned`.
 - **Getting the repo into the guest — `vm_sync_repo`, not a live share.** The first version of
   this script exported the checkout via `-virtfs local,...,security_model=none`, the same
-  mechanism §8b uses. **The first real KVM run of this tooling (2026-07-13) found that this is
-  broken for any host checkout with normal-or-tighter permissions**: `security_model=none`
+  mechanism the now-removed one-shot path (§8b) used. **The first real KVM run of this tooling
+  (2026-07-13) found that this is broken for any host checkout with normal-or-tighter
+  permissions**: `security_model=none`
   passes the host's raw uid/gid/mode straight through to the guest, so `ls -ld` on the mounted
   share showed the guest reporting the exact host owner (uid/gid `UNKNOWN` inside the guest, no
   matching `/etc/passwd` entry) and mode. Root always bypasses that check (which is why
@@ -580,8 +481,8 @@ neither the persistent VM nor the bare-host setup is available, `ci` prints all 
   log, qemu's pidfile, and a `provisioned` marker. Deliberately excluded from what gets synced
   into the guest (see above) — the guest has no reason to ever see its own host-side key material.
 
-**Security model for the SSH transport (this is new attack surface `test-e2e-vm` doesn't have,
-since that path never listens for inbound connections):**
+**Security model for the SSH transport** (attack surface specific to this path — a design with no
+inbound listener at all wouldn't have it):
 - **The forwarded port is bound to `127.0.0.1` only** (`hostfwd=tcp:127.0.0.1:<port>-:22`, not
   the bare `hostfwd=tcp::<port>-:22` form, which binds `0.0.0.0` and would expose the guest's
   sshd to the whole network — an easy mistake, since most hostfwd examples online use the bare
@@ -641,32 +542,30 @@ since that path never listens for inbound connections):**
 - `qemu-img create -F qcow2` and the `-daemonize`/`-pidfile` combination were both exercised for
   real (the latter confirmed to write the correct PID before the launching shell command returns).
 
-What is still not verified: `e2e-vm-down.sh`'s teardown path itself (graceful SSH poweroff, disk
-wipe) hasn't had an explicit real-KVM confirmation logged, though nothing about it is exotic
-relative to what has been verified. Running the *ephemeral* one-shot path (`test-e2e-vm`, §8b)
-against real KVM remains outstanding, and — per §8b — it has the identical 9p-permission bug,
-unfixed there.
+`e2e-vm-down.sh`'s teardown path (graceful SSH `poweroff`, state-dir wipe) was also exercised for
+real as part of the same session, between the two runs above — used specifically to retire the
+pre-fix VM before rebuilding with the `vm_sync_repo` fix. At this point every command in the
+`setup-e2e-vm` → `e2e-vm-up` → `e2e-vm-test` → `e2e-vm-down` cycle has been run for real against a
+real KVM host at least once.
 
 ## 9. Testing & coverage
 
 - `just ci` — the single command: format check, clippy (deny-on-warnings, `--all-targets
   --all-features`), unit tests, and the e2e suite against whichever of the following is
   available, in order: a persistent e2e VM already up (§8c), the bare-host setup (checked via
-  `docker info` + `id e2e-agent`), or — if neither — a clear message listing all three ways to
-  get one running, never a silent skip.
+  `docker info` + `id e2e-agent`), or — if neither — a clear message listing both ways to get one
+  running, never a silent skip.
 - `just test-unit` / `just test-e2e` / `just test-all` — independently runnable, per the
   requirement that unit and e2e stay separable.
-- `just setup-e2e-vm` / `just test-e2e-vm` (recommended over `setup-e2e`/`test-e2e` for a single
-  run) — runs the e2e suite inside a disposable QEMU VM instead of on this machine, so
-  `setup-e2e-env.sh`'s host-level changes never touch the machine actually running the tooling;
-  this machine only needs QEMU + `/dev/kvm` access, which `setup-e2e-vm` gets for you (sudo used
-  once, for two generic non-App-Salmon-specific things). See §8b for the design and its
-  verification status.
-- `just e2e-vm-up` / `e2e-vm-test` / `e2e-vm-down` (recommended over `test-e2e-vm` if you're
-  running the suite more than once in a sitting) — same disposable-VM idea, but the VM stays up
-  across multiple test runs instead of being discarded every call, and `just ci` detects and uses
-  it automatically. See §8c for the design, the SSH transport's security model, and its
-  verification status.
+- `just setup-e2e-vm` / `e2e-vm-up` / `e2e-vm-test` / `e2e-vm-down` (recommended over
+  `setup-e2e`/`test-e2e`) — runs the e2e suite inside a disposable, persistent QEMU VM instead of
+  on this machine, so `setup-e2e-env.sh`'s host-level changes never touch the machine actually
+  running the tooling; this machine only needs QEMU + `/dev/kvm` access, which `setup-e2e-vm` gets
+  for you (sudo used once, for two generic non-App-Salmon-specific things). The VM stays up across
+  multiple test runs instead of being discarded every call, and `just ci` detects and uses it
+  automatically once it's up. See §8c for the design, the SSH transport's security model, and its
+  verification status (confirmed working end to end against a real KVM host, including all 18 e2e
+  tests and the arbitrary-uid Postgres path from §8a).
 - `just coverage` (needs `cargo install cargo-llvm-cov` + `rustup component add
   llvm-tools-preview` once per machine) — measures the **entire** `--lib` target, no
   `--ignore-filename-regex` carve-out for adapters. Current state (2026-07-12): 96.2% region /
