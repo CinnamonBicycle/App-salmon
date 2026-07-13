@@ -46,4 +46,55 @@ echo "== e2e prerequisites (client accounts, sudoers rule, postgres image) =="
 # calling it on every provision pass rather than only on first boot is deliberate, not wasteful.
 APP_SALMON_USER="$GUEST_USER" /repo/scripts/setup-e2e-env.sh
 
+echo "== kata containers =="
+# Pinned, not "latest": empirically verified working at this exact version (2026-07-13, real KVM
+# host) after finding two real bugs in the "standard" install path — see docs/DESIGN.md for the
+# full story. Bump deliberately, re-verifying, not by drifting.
+KATA_VERSION="3.32.0"
+if [ -x /opt/kata/bin/kata-runtime ] && docker info 2>/dev/null | grep -q ' kata'; then
+	echo "  already installed and registered"
+else
+	# kata-manager.sh (the project's own documented installer) is broken against this release:
+	# it verifies /opt/kata/bin exists post-extraction, but 3.32.0's tarball only ships the (now
+	# Rust-only) shim under runtime-rs/bin/, not bin/ — the installer's own check predates that
+	# layout change and fails every time, even with an explicit older-version pin (tried 3.30.0
+	# too). Confirmed by extracting the exact same release tarball by hand: the real content
+	# (including /opt/kata/bin/kata-runtime) is all there and correct — only the installer
+	# script's completion check is stale. Downloading and extracting the official static release
+	# tarball directly sidesteps the broken check entirely.
+	if [ ! -d /opt/kata ]; then
+		echo "  downloading kata-static-${KATA_VERSION}"
+		curl -fsSL -o /tmp/kata-static.tar.zst \
+			"https://github.com/kata-containers/kata-containers/releases/download/${KATA_VERSION}/kata-static-${KATA_VERSION}-amd64.tar.zst"
+		tar -I zstd -xf /tmp/kata-static.tar.zst -C /
+		rm -f /tmp/kata-static.tar.zst
+	fi
+	ln -sf /opt/kata/runtime-rs/bin/containerd-shim-kata-v2 /usr/bin/containerd-shim-kata-v2
+	ln -sf /opt/kata/bin/kata-runtime /usr/bin/kata-runtime
+
+	# Docker's own runtime-name validation rejects any name not in its "runtimes" map (unlike
+	# containerd, which will resolve any name to a containerd-shim-<name>-v2 binary on PATH) —
+	# this map entry is what makes `docker run --runtime kata` accepted at all. The key is
+	# "runtimeType", not "path": "path" is Docker's *legacy* mechanism for a raw runc-CLI-style
+	# binary (create/start/--bundle/--root args) and produces a real but misleading runtime
+	# error ("flag provided but not defined: -root") when pointed at a shim-v2 binary, which
+	# speaks a completely different (GRPC task-management) protocol. "runtimeType" tells Docker
+	# to hand the name straight to containerd's native runtime-v2 shim resolution instead, which
+	# is what containerd-shim-kata-v2 actually implements. Confirmed both ways empirically —
+	# "path" reproduces the "-root" failure every time, "runtimeType" works.
+	python3 - <<'PYEOF'
+import json
+path = "/etc/docker/daemon.json"
+try:
+    with open(path) as f:
+        config = json.load(f)
+except FileNotFoundError:
+    config = {}
+config.setdefault("runtimes", {})["kata"] = {"runtimeType": "io.containerd.kata.v2"}
+with open(path, "w") as f:
+    json.dump(config, f, indent=2)
+PYEOF
+	systemctl restart docker
+fi
+
 echo "== provisioning complete =="

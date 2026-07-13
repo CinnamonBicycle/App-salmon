@@ -730,3 +730,81 @@ calls it, now exclusively inside the disposable VM (§8c), where it's exercised 
    clients existed). `max_clusters_per_user` (how many directory slots a single client's account
    needs) is still a first-guess value from the original design writeup — revisit with real usage
    data (§7g).
+
+## 11. §7(a)+§7(c) combined: Supabase spawning + untrusted-tar validation + Kata edge functions
+
+In progress. §7(a) and §7(c) were originally separate, differently-prioritized deferred items;
+this work combines them deliberately, on the reasoning that building trusted-Supabase-in-Docker
+first and retrofitting Kata later risked rework, and that Kata's host/guest infrastructure should
+be proven early — the same discipline that drove proving QEMU/KVM early (§8) before building VM
+tooling on top of it. Full scope/architecture decisions are tracked in the session's working plan,
+not duplicated here; this section records what's been *verified*, milestone by milestone, as it
+happens — matching this document's established practice of recording real findings as they land
+rather than only once a phase is fully complete.
+
+### M0 — Kata/nested-KVM feasibility probe: passed, 2026-07-13
+
+**A key clarification worth recording plainly: Kata Containers is not "Docker running inside a
+VM."** It's a drop-in replacement for `runc` — registered as an alternate OCI/containerd runtime
+— that boots a minimal micro-VM per container and runs the container's process directly inside
+it, with no nested container runtime in the guest at all. From the `ContainerRuntime` port's
+perspective, spawning a container under Kata should look identical to spawning one under `runc`;
+only the isolation mechanism underneath differs.
+
+This was proven for real, on a real KVM host, inside App Salmon's own persistent e2e VM (§8c) —
+not assumed. The chain of dependencies: this session's sandbox was granted real `/dev/kvm` access;
+nested virtualization was already enabled at the host kernel module level; the e2e VM's existing
+`-cpu host` flag (chosen for unrelated reasons in §8c) passes those extensions through to the
+guest without any change to the outer QEMU invocation. Confirmed directly: `svm` visible in the
+guest's `/proc/cpuinfo`, `/dev/kvm` present inside the guest.
+
+**Two real bugs were found and fixed while installing Kata 3.32.0 inside the guest, both now
+captured as an idempotent section in `scripts/vm/guest-provision.sh`, re-verified from a
+completely fresh VM (not just idempotency-checked on an already-provisioned one):**
+
+1. **Kata's own installer script (`kata-manager.sh`) is broken against current releases.** It
+   verifies `/opt/kata/bin` exists after extraction, but the 3.32.0 release tarball (and 3.30.0,
+   tested too — not version-specific) ships the now-Rust-only shim under `runtime-rs/bin/`
+   instead, not `bin/`. The installer's completion check predates that layout change and fails
+   every time, even though the actual extracted content (including `/opt/kata/bin/kata-runtime`,
+   confirmed present) is complete and correct. Worked around by downloading and extracting the
+   official static release tarball directly (`kata-static-<version>-amd64.tar.zst` from the
+   project's GitHub releases), bypassing the installer script's broken check entirely, then
+   symlinking `containerd-shim-kata-v2` and `kata-runtime` onto `PATH`.
+2. **Registering the runtime with Docker needs `daemon.json`'s `runtimeType` key, not `path`.**
+   Docker's own runtime-name validation rejects any name not present in its `/etc/docker/
+   daemon.json` `"runtimes"` map (containerd itself would resolve any name to a
+   `containerd-shim-<name>-v2` binary on `PATH` without this, but Docker's own layer in front of
+   that doesn't). The `"path"` key is Docker's *legacy* mechanism, for a raw `runc`-CLI-compatible
+   binary — pointing it at a shim-v2 binary produces a real, misleading failure
+   (`flag provided but not defined: -root`), since shim-v2 speaks a completely different
+   (containerd task-management GRPC) protocol than the `create`/`start`/`--bundle`/`--root`
+   CLI convention Docker's legacy path assumes. `"runtimeType": "io.containerd.kata.v2"` instead
+   tells Docker to hand the name straight to containerd's native runtime-v2 shim resolution,
+   which is what `containerd-shim-kata-v2` actually implements. Confirmed both ways empirically —
+   `"path"` reproduces the `-root` failure every time; `"runtimeType"` works. (A third path was
+   tried and found unnecessary: manually registering the runtime in containerd's own CRI-plugin
+   config, `/etc/containerd/config.toml` — that config surface is what Kubernetes' kubelet
+   consults via CRI, not what `dockerd` consults for its own direct container-creation API. Kata
+   worked identically with that file removed; `guest-provision.sh` does not touch it.)
+
+**Verification, not just "the command didn't error":** a container run with `docker run --runtime
+kata ...` was confirmed to actually execute inside a separate kernel — `uname -r` inside the
+container reported `6.18.35` (Kata's own bundled guest kernel) while the outer e2e VM's own
+kernel is `6.8.0-124-generic` — and a real `qemu-system-x86_64` process (`-machine
+q35,accel=kvm`) was observed running for the container's lifetime. `sudo kata-runtime check`
+(the project's own capability probe) also reports both "capable of" and "can currently create"
+Kata Containers. This is the strongest evidence available short of a full workload trace that
+containers really are VM-isolated under this configuration, not silently falling back to a
+shared-kernel runtime.
+
+**Guest-provisioning changes**: `scripts/vm/guest-provision.sh` gained an idempotent `kata
+containers` section (checks for `/opt/kata/bin/kata-runtime` + Docker reporting `kata` as a
+registered runtime before doing anything) implementing exactly the sequence above, pinned to Kata
+`3.32.0` deliberately (not "latest" — bump by re-verifying, not by drifting, matching this
+project's established pattern for the base cloud image and other fixed dependencies).
+
+**Not yet built:** all of the Rust-side work (M1 onward) — `OciRuntime` enum on `ContainerSpec`,
+per-cluster Docker networking, `SupabaseBackend`, tar validation, the HTTP multipart upload path.
+M0 specifically was the hard, early-gated dependency risk; passing it means the rest of the work
+can proceed with confidence the underlying mechanism works, but none of it exists yet.
