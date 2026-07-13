@@ -154,9 +154,12 @@ async fn build_task_deps(
         "resolved configured clients' unix accounts"
     );
 
+    // TODO(§7a+§7c M4/M5): "kata" is a placeholder until `[supabase].kata_runtime_name` config
+    // lands — see docs/DESIGN.md §11. Matches what scripts/vm/guest-provision.sh registers it as.
     let container_runtime = Arc::new(BollardContainerRuntime::connect(
         &config.docker.socket_path,
         10,
+        "kata",
     )?);
     let privileged_exec = Arc::new(SudoExecutor::new("sudo", Duration::from_secs(30)));
     let worker_data_dir_base = config

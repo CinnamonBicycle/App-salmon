@@ -105,6 +105,92 @@ pub struct BindMount {
     pub container_path: String,
 }
 
+/// The OCI/containerd runtime a container is created under — a closed enum, not a free-form
+/// string, so every call site states its choice explicitly and the compiler catches an
+/// unhandled variant if a third one is ever added. Named `OciRuntime` rather than `ContainerRuntime`
+/// specifically to avoid colliding with this port's own trait name.
+///
+/// [`OciRuntime::Kata`] is **not** "Docker running inside a VM" — it's a drop-in replacement for
+/// `runc` that boots a minimal micro-VM per container and runs the container's process directly
+/// inside it, with no nested container runtime in the guest. From this port's perspective the two
+/// variants differ only in which runtime string reaches the daemon; see `docs/DESIGN.md` §11 for
+/// how this was verified (a real, separately-kerneled micro-VM per `Kata` container, confirmed on
+/// a real KVM host) and exactly what installing/registering it involves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OciRuntime {
+    /// The daemon's default OCI runtime — shared-kernel namespace/cgroup isolation. Used for
+    /// trusted, vetted software (e.g. Postgres, `PostgREST`, `GoTrue`, Kong).
+    Runc,
+    /// Kata Containers — per-container micro-VM isolation. Used for arbitrary, untrusted
+    /// caller-supplied code (e.g. Supabase edge functions).
+    Kata,
+}
+
+/// Opaque handle to a Docker network the runtime created. Carries just enough to look the network
+/// back up later (remove), mirroring [`ContainerHandle`]'s shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NetworkHandle(
+    /// The network's name — chosen by us (deterministically derived from a `ClusterId`), not
+    /// daemon-assigned, so nothing extra needs to be persisted for later lookup.
+    String,
+);
+
+impl NetworkHandle {
+    /// Wraps a raw network name as a [`NetworkHandle`].
+    ///
+    /// # Arguments
+    ///
+    /// - `name`: the network's name.
+    ///
+    /// # Returns
+    ///
+    /// The wrapped handle.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// Borrows the underlying network name as a plain string slice.
+    ///
+    /// # Returns
+    ///
+    /// The raw network name this handle wraps.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for NetworkHandle {
+    /// Writes the underlying network name, unmodified.
+    ///
+    /// # Arguments
+    ///
+    /// - `f`: the formatter to write the network name to.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success, or the formatter's write error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if writing to `f` itself fails.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Attaches a container to a Docker network under a DNS-resolvable name other containers on that
+/// network can reach it by (e.g. Kong reaching Postgres via the alias `db`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkAttachment {
+    /// The network to join — must already exist (created via
+    /// [`ContainerRuntime::create_network`]).
+    pub network_name: String,
+    /// The DNS name other containers on the same network reach this one by.
+    pub alias: String,
+}
+
 /// Declarative description of the container to create. Intentionally has no notion of "how to
 /// get here" (no builder mutation) — a `ContainerSpec` is a value, constructed once by a backend
 /// (e.g. `backends::postgres`) and handed to the runtime.
@@ -138,6 +224,12 @@ pub struct ContainerSpec {
     /// one). Readiness polling (`ContainerStatus::Running`'s `health` field) only reflects
     /// anything meaningful if either this or the image itself declares a healthcheck.
     pub health_check: Option<HealthCheck>,
+    /// Which OCI runtime creates this container. Non-optional and explicit — no implicit
+    /// "unspecified means whatever the daemon defaults to" — every call site states its choice.
+    pub runtime: OciRuntime,
+    /// Which Docker network to join and under what alias, if any. `None` means the container
+    /// gets only the daemon's default network with no custom alias.
+    pub network: Option<NetworkAttachment>,
 }
 
 impl fmt::Debug for ContainerSpec {
@@ -168,6 +260,8 @@ impl fmt::Debug for ContainerSpec {
             .field("bind_mount", &self.bind_mount)
             .field("run_as", &self.run_as)
             .field("health_check", &self.health_check)
+            .field("runtime", &self.runtime)
+            .field("network", &self.network)
             .finish()
     }
 }
@@ -260,6 +354,25 @@ pub enum DockerError {
         /// The process's exit code, if it exited (as opposed to vanishing entirely).
         exit_code: Option<i32>,
     },
+    /// The daemon rejected (or failed to process) a network-create request.
+    #[error("failed to create network {name}: {source}")]
+    CreateNetwork {
+        /// The network name that failed to be created.
+        name: String,
+        /// The underlying `bollard` error.
+        #[source]
+        source: bollard::errors::Error,
+    },
+    /// A request to remove a network failed (other than the network already being gone, which is
+    /// treated as success, not an error).
+    #[error("failed to remove network {network}: {source}")]
+    RemoveNetwork {
+        /// The network that failed to be removed.
+        network: NetworkHandle,
+        /// The underlying `bollard` error.
+        #[source]
+        source: bollard::errors::Error,
+    },
 }
 
 #[async_trait]
@@ -313,11 +426,49 @@ pub trait ContainerRuntime: Send + Sync {
     /// Returns [`DockerError::RemoveContainer`] if the daemon can't be reached or returns an
     /// unexpected failure while stopping/removing the container.
     async fn stop_and_remove(&self, handle: &ContainerHandle) -> Result<(), DockerError>;
+
+    /// Creates a Docker network for containers to be attached to via
+    /// [`ContainerSpec::network`], so they can address each other by name (e.g. Kong reaching
+    /// Postgres via the alias `db`).
+    ///
+    /// # Arguments
+    ///
+    /// - `name`: the network's name — chosen by the caller, deterministically, so it can be
+    ///   recomputed later for removal with nothing extra to persist.
+    ///
+    /// # Returns
+    ///
+    /// A handle to the newly created network.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerError::CreateNetwork`] if the daemon rejects the create request.
+    async fn create_network(&self, name: &str) -> Result<NetworkHandle, DockerError>;
+
+    /// Removes a network. Idempotent: a network that's already gone is treated as success, not
+    /// an error. Callers must remove every container attached to a network before removing the
+    /// network itself — the daemon refuses to remove a network with containers still attached.
+    ///
+    /// # Arguments
+    ///
+    /// - `handle`: the network to remove.
+    ///
+    /// # Returns
+    ///
+    /// Nothing, on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerError::RemoveNetwork`] if the daemon can't be reached or returns an
+    /// unexpected failure while removing the network.
+    async fn remove_network(&self, handle: &NetworkHandle) -> Result<(), DockerError>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BindMount, ContainerHandle, ContainerSpec};
+    use super::{
+        BindMount, ContainerHandle, ContainerSpec, NetworkAttachment, NetworkHandle, OciRuntime,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -325,6 +476,13 @@ mod tests {
         let handle = ContainerHandle::new("app-salmon-01ABC");
         assert_eq!(handle.to_string(), "app-salmon-01ABC");
         assert_eq!(handle.as_str(), "app-salmon-01ABC");
+    }
+
+    #[test]
+    fn network_handle_display_shows_the_raw_name() {
+        let handle = NetworkHandle::new("app-salmon-net-01ABC");
+        assert_eq!(handle.to_string(), "app-salmon-net-01ABC");
+        assert_eq!(handle.as_str(), "app-salmon-net-01ABC");
     }
 
     fn sample_spec() -> ContainerSpec {
@@ -349,6 +507,11 @@ mod tests {
             }),
             run_as: Some((2000, 2000)),
             health_check: None,
+            runtime: OciRuntime::Runc,
+            network: Some(NetworkAttachment {
+                network_name: "app-salmon-net-01ABC".to_string(),
+                alias: "db".to_string(),
+            }),
         }
     }
 
@@ -375,5 +538,7 @@ mod tests {
         assert!(debug_output.contains("5432"));
         assert!(debug_output.contains("salmon-worker-00"));
         assert!(debug_output.contains("2000"));
+        assert!(debug_output.contains("Runc"));
+        assert!(debug_output.contains("app-salmon-net-01ABC"));
     }
 }

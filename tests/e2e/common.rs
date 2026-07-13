@@ -63,7 +63,7 @@ impl Drop for TestServer {
 /// Fails loudly (panics with a clear remediation message) if this machine isn't set up for the
 /// e2e suite — never silently skips.
 pub async fn ensure_prerequisites() {
-    let runtime = match BollardContainerRuntime::connect(DOCKER_SOCKET, 5) {
+    let runtime = match BollardContainerRuntime::connect(DOCKER_SOCKET, 5, "kata") {
         Ok(runtime) => runtime,
         Err(err) => panic!("docker daemon at {DOCKER_SOCKET} is not reachable: {err}{REMEDIATION}"),
     };
@@ -111,8 +111,9 @@ pub async fn spawn_test_server() -> TestServer {
             .await
             .expect("open sqlite"),
     );
-    let container_runtime =
-        Arc::new(BollardContainerRuntime::connect(DOCKER_SOCKET, 10).expect("connect docker"));
+    let container_runtime = Arc::new(
+        BollardContainerRuntime::connect(DOCKER_SOCKET, 10, "kata").expect("connect docker"),
+    );
     let clock = Arc::new(SystemClock);
     let secrets = Arc::new(RandSecretGenerator);
     let privileged_exec = Arc::new(SudoExecutor::new("sudo", Duration::from_secs(30)));

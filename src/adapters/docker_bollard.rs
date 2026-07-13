@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, ContainerInspectResponse, HealthConfig, HealthStatusEnum, HostConfig,
-    PortBinding,
+    ContainerCreateBody, ContainerInspectResponse, EndpointSettings, HealthConfig,
+    HealthStatusEnum, HostConfig, NetworkCreateRequest, NetworkingConfig, PortBinding,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, InspectContainerOptions, RemoveContainerOptions, StartContainerOptions,
@@ -26,12 +26,19 @@ use bollard::query_parameters::{
 
 use crate::ports::container_runtime::{
     ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, DockerError, HealthState,
+    NetworkHandle, OciRuntime,
 };
 
 /// [`ContainerRuntime`] backed by a real Docker Engine API connection.
 pub struct BollardContainerRuntime {
     /// The connected `bollard` client every trait method issues requests through.
     client: Docker,
+    /// The runtime name [`OciRuntime::Kata`] maps to on the wire — whatever the target daemon's
+    /// `daemon.json` actually registers Kata under (see `docs/DESIGN.md` §11: this environment's
+    /// `scripts/vm/guest-provision.sh` always registers it as `"kata"`, but a different real
+    /// deployment could register it under another name, so this is a deployment-level constructor
+    /// parameter rather than a hardcoded literal).
+    kata_runtime_name: String,
 }
 
 impl BollardContainerRuntime {
@@ -43,6 +50,7 @@ impl BollardContainerRuntime {
     ///   `/var/run/docker.sock`).
     /// - `timeout_secs`: per-request timeout `bollard` applies to calls made through the
     ///   resulting client.
+    /// - `kata_runtime_name`: the runtime name [`OciRuntime::Kata`] maps to on this daemon.
     ///
     /// # Returns
     ///
@@ -51,14 +59,21 @@ impl BollardContainerRuntime {
     /// # Errors
     ///
     /// Returns [`DockerError::Connect`] if the socket can't be reached.
-    pub fn connect(socket_path: &str, timeout_secs: u64) -> Result<Self, DockerError> {
+    pub fn connect(
+        socket_path: &str,
+        timeout_secs: u64,
+        kata_runtime_name: impl Into<String>,
+    ) -> Result<Self, DockerError> {
         let client =
             Docker::connect_with_unix(socket_path, timeout_secs, bollard::API_DEFAULT_VERSION)
                 .map_err(|source| DockerError::Connect {
                     socket: socket_path.to_string(),
                     source,
                 })?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            kata_runtime_name: kata_runtime_name.into(),
+        })
     }
 }
 
@@ -88,14 +103,19 @@ fn is_not_found(error: &BollardError) -> bool {
 /// # Arguments
 ///
 /// - `spec`: the declarative container description to translate.
+/// - `kata_runtime_name`: the wire runtime name [`OciRuntime::Kata`] maps to — see
+///   [`BollardContainerRuntime::kata_runtime_name`].
 ///
 /// # Returns
 ///
 /// A `ContainerCreateBody` ready to hand to `bollard::Docker::create_container` — environment
 /// variables formatted as `KEY=value` strings, the bind mount (if any) as a `host:container`
 /// string, the healthcheck (if any) translated into Docker's nanosecond-duration `HealthConfig`,
-/// and the container's single port exposed and bound to `127.0.0.1`.
-fn container_create_body(spec: &ContainerSpec) -> ContainerCreateBody {
+/// the container's single port exposed and bound to `127.0.0.1`, the OCI runtime
+/// ([`OciRuntime::Runc`] omits `HostConfig.runtime` entirely, letting the daemon's own default
+/// apply — [`OciRuntime::Kata`] sets it to `kata_runtime_name`), and the network attachment (if
+/// any) with its alias.
+fn container_create_body(spec: &ContainerSpec, kata_runtime_name: &str) -> ContainerCreateBody {
     let env: Vec<String> = spec
         .env
         .iter()
@@ -128,6 +148,21 @@ fn container_create_body(spec: &ContainerSpec) -> ContainerCreateBody {
         start_interval: None,
     });
 
+    let runtime = match spec.runtime {
+        OciRuntime::Runc => None,
+        OciRuntime::Kata => Some(kata_runtime_name.to_string()),
+    };
+
+    let networking_config = spec.network.as_ref().map(|attachment| NetworkingConfig {
+        endpoints_config: Some(HashMap::from([(
+            attachment.network_name.clone(),
+            EndpointSettings {
+                aliases: Some(vec![attachment.alias.clone()]),
+                ..Default::default()
+            },
+        )])),
+    });
+
     ContainerCreateBody {
         image: Some(spec.image.clone()),
         env: (!env.is_empty()).then_some(env),
@@ -135,9 +170,11 @@ fn container_create_body(spec: &ContainerSpec) -> ContainerCreateBody {
         exposed_ports: Some(vec![container_port_proto]),
         user: spec.run_as.map(|(uid, gid)| format!("{uid}:{gid}")),
         healthcheck,
+        networking_config,
         host_config: Some(HostConfig {
             binds,
             port_bindings: Some(port_bindings),
+            runtime,
             ..Default::default()
         }),
         ..Default::default()
@@ -245,8 +282,9 @@ impl ContainerRuntime for BollardContainerRuntime {
             name: Some(spec.name.clone()),
             platform: String::new(),
         };
+        let body = container_create_body(spec, &self.kata_runtime_name);
         self.client
-            .create_container(Some(options), container_create_body(spec))
+            .create_container(Some(options), body)
             .await
             .map_err(|source| DockerError::CreateContainer { source })?;
 
@@ -328,6 +366,60 @@ impl ContainerRuntime for BollardContainerRuntime {
             }),
         }
     }
+
+    /// Creates a Docker network via `POST /networks/create`.
+    ///
+    /// # Arguments
+    ///
+    /// - `name`: the network's name.
+    ///
+    /// # Returns
+    ///
+    /// A [`NetworkHandle`] naming the created network — always `name`, since we choose network
+    /// names ourselves rather than letting the daemon assign one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerError::CreateNetwork`] if the daemon rejects the create request.
+    async fn create_network(&self, name: &str) -> Result<NetworkHandle, DockerError> {
+        self.client
+            .create_network(NetworkCreateRequest {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|source| DockerError::CreateNetwork {
+                name: name.to_string(),
+                source,
+            })?;
+        Ok(NetworkHandle::new(name))
+    }
+
+    /// Removes a network via `DELETE /networks/{name}`.
+    ///
+    /// # Arguments
+    ///
+    /// - `handle`: the network to remove.
+    ///
+    /// # Returns
+    ///
+    /// Nothing on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DockerError::RemoveNetwork`] for any daemon error other than "not found" — a
+    /// network that's already gone is treated as a successful removal (idempotent), not an
+    /// error.
+    async fn remove_network(&self, handle: &NetworkHandle) -> Result<(), DockerError> {
+        match self.client.remove_network(handle.as_str()).await {
+            Ok(()) => Ok(()),
+            Err(source) if is_not_found(&source) => Ok(()),
+            Err(source) => Err(DockerError::RemoveNetwork {
+                network: handle.clone(),
+                source,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +467,10 @@ mod test_support {
         remove_not_found: AtomicBool,
         remove_server_error: AtomicBool,
         last_create_body: Mutex<Option<serde_json::Value>>,
+        fail_network_create: AtomicBool,
+        network_remove_not_found: AtomicBool,
+        network_remove_server_error: AtomicBool,
+        last_network_create_body: Mutex<Option<serde_json::Value>>,
     }
 
     pub struct FakeDockerEngine {
@@ -402,6 +498,10 @@ mod test_support {
                 remove_not_found: AtomicBool::new(false),
                 remove_server_error: AtomicBool::new(false),
                 last_create_body: Mutex::new(None),
+                fail_network_create: AtomicBool::new(false),
+                network_remove_not_found: AtomicBool::new(false),
+                network_remove_server_error: AtomicBool::new(false),
+                last_network_create_body: Mutex::new(None),
             });
 
             let router = Router::new()
@@ -409,6 +509,8 @@ mod test_support {
                 .route("/containers/{name}/start", post(start_handler))
                 .route("/containers/{name}/json", get(inspect_handler))
                 .route("/containers/{name}", delete(remove_handler))
+                .route("/networks/create", post(network_create_handler))
+                .route("/networks/{name}", delete(network_remove_handler))
                 .with_state(state.clone());
 
             let listener =
@@ -449,6 +551,31 @@ mod test_support {
         /// assert on exactly what was serialized and sent, not just that the call succeeded.
         pub fn last_create_body(&self) -> Option<serde_json::Value> {
             self.state.last_create_body.lock().expect("lock").clone()
+        }
+
+        pub fn fail_next_network_create(&self) {
+            self.state.fail_network_create.store(true, Ordering::SeqCst);
+        }
+
+        pub fn network_remove_returns_not_found(&self) {
+            self.state
+                .network_remove_not_found
+                .store(true, Ordering::SeqCst);
+        }
+
+        pub fn network_remove_returns_server_error(&self) {
+            self.state
+                .network_remove_server_error
+                .store(true, Ordering::SeqCst);
+        }
+
+        /// The JSON body of the most recent `/networks/create` request, if any.
+        pub fn last_network_create_body(&self) -> Option<serde_json::Value> {
+            self.state
+                .last_network_create_body
+                .lock()
+                .expect("lock")
+                .clone()
         }
     }
 
@@ -549,6 +676,46 @@ mod test_support {
             StatusCode::NO_CONTENT.into_response()
         }
     }
+
+    async fn network_create_handler(
+        State(state): State<Arc<FakeState>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        *state.last_network_create_body.lock().expect("lock") = Some(body);
+        if state.fail_network_create.load(Ordering::SeqCst) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": "simulated network create failure"})),
+            )
+                .into_response();
+        }
+        (
+            StatusCode::CREATED,
+            Json(json!({"Id": "fake-network-id", "Warning": ""})),
+        )
+            .into_response()
+    }
+
+    async fn network_remove_handler(
+        State(state): State<Arc<FakeState>>,
+        Path(_name): Path<String>,
+    ) -> Response {
+        if state.network_remove_not_found.load(Ordering::SeqCst) {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": "no such network"})),
+            )
+                .into_response()
+        } else if state.network_remove_server_error.load(Ordering::SeqCst) {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": "simulated network remove failure"})),
+            )
+                .into_response()
+        } else {
+            StatusCode::NO_CONTENT.into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +724,7 @@ mod tests {
     use super::test_support::{FakeDockerEngine, FakeHealth, InspectScenario};
     use crate::ports::container_runtime::{
         BindMount, ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, HealthState,
+        NetworkAttachment, NetworkHandle, OciRuntime,
     };
     use std::collections::HashMap;
 
@@ -574,11 +742,13 @@ mod tests {
             }),
             run_as: Some((2000, 2000)),
             health_check: None,
+            runtime: OciRuntime::Runc,
+            network: None,
         }
     }
 
     fn runtime(engine: &FakeDockerEngine) -> BollardContainerRuntime {
-        BollardContainerRuntime::connect(&engine.socket_path.to_string_lossy(), 5)
+        BollardContainerRuntime::connect(&engine.socket_path.to_string_lossy(), 5, "kata")
             .expect("connect to fake engine")
     }
 
@@ -903,10 +1073,179 @@ mod tests {
 
     #[test]
     fn connect_fails_for_nonexistent_socket() {
-        match BollardContainerRuntime::connect("/nonexistent/docker.sock", 1) {
+        match BollardContainerRuntime::connect("/nonexistent/docker.sock", 1, "kata") {
             Err(crate::ports::container_runtime::DockerError::Connect { .. }) => {}
             Err(other) => panic!("expected DockerError::Connect, got {other:?}"),
             Ok(_) => panic!("expected connect to fail for a nonexistent socket"),
         }
+    }
+
+    #[tokio::test]
+    async fn runc_spec_sends_no_runtime_field() {
+        let engine = FakeDockerEngine::start(InspectScenario::Running {
+            host_port: None,
+            health: FakeHealth::None,
+        });
+        let runtime = runtime(&engine);
+
+        runtime
+            .create_and_start(&sample_spec("app-salmon-runc"))
+            .await
+            .expect("create succeeds");
+
+        let body = engine
+            .last_create_body()
+            .expect("a create request was sent");
+        assert!(
+            body["HostConfig"]
+                .get("Runtime")
+                .is_none_or(serde_json::Value::is_null),
+            "runc should not set an explicit Runtime: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kata_spec_sends_the_configured_runtime_name() {
+        let engine = FakeDockerEngine::start(InspectScenario::Running {
+            host_port: None,
+            health: FakeHealth::None,
+        });
+        // Deliberately different from the default "kata" used elsewhere in this test module, to
+        // confirm the wire value really is the constructor-provided name, not a hardcoded literal.
+        let runtime =
+            BollardContainerRuntime::connect(&engine.socket_path.to_string_lossy(), 5, "kata-qemu")
+                .expect("connect to fake engine");
+
+        let mut spec = sample_spec("app-salmon-kata");
+        spec.runtime = OciRuntime::Kata;
+        runtime
+            .create_and_start(&spec)
+            .await
+            .expect("create succeeds");
+
+        let body = engine
+            .last_create_body()
+            .expect("a create request was sent");
+        assert_eq!(body["HostConfig"]["Runtime"], "kata-qemu");
+    }
+
+    #[tokio::test]
+    async fn network_attachment_sends_the_alias_on_the_named_network() {
+        let engine = FakeDockerEngine::start(InspectScenario::Running {
+            host_port: None,
+            health: FakeHealth::None,
+        });
+        let runtime = runtime(&engine);
+
+        let mut spec = sample_spec("app-salmon-networked");
+        spec.network = Some(NetworkAttachment {
+            network_name: "app-salmon-net-01ABC".to_string(),
+            alias: "db".to_string(),
+        });
+        runtime
+            .create_and_start(&spec)
+            .await
+            .expect("create succeeds");
+
+        let body = engine
+            .last_create_body()
+            .expect("a create request was sent");
+        let endpoint = &body["NetworkingConfig"]["EndpointsConfig"]["app-salmon-net-01ABC"];
+        assert_eq!(endpoint["Aliases"], serde_json::json!(["db"]));
+    }
+
+    #[tokio::test]
+    async fn create_and_start_sends_no_networking_config_when_the_spec_has_none() {
+        let engine = FakeDockerEngine::start(InspectScenario::Running {
+            host_port: None,
+            health: FakeHealth::None,
+        });
+        let runtime = runtime(&engine);
+
+        runtime
+            .create_and_start(&sample_spec("app-salmon-no-network"))
+            .await
+            .expect("create succeeds");
+
+        let body = engine
+            .last_create_body()
+            .expect("a create request was sent");
+        assert!(
+            body.get("NetworkingConfig")
+                .is_none_or(serde_json::Value::is_null),
+            "no networking config should be sent when the spec doesn't set one: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_network_returns_a_handle_named_after_the_request() {
+        let engine = FakeDockerEngine::start(InspectScenario::NotFound);
+        let runtime = runtime(&engine);
+
+        let handle = runtime
+            .create_network("app-salmon-net-01ABC")
+            .await
+            .expect("create network succeeds");
+        assert_eq!(handle, NetworkHandle::new("app-salmon-net-01ABC"));
+
+        let body = engine
+            .last_network_create_body()
+            .expect("a network create request was sent");
+        assert_eq!(body["Name"], "app-salmon-net-01ABC");
+    }
+
+    #[tokio::test]
+    async fn create_network_failure_is_reported() {
+        let engine = FakeDockerEngine::start(InspectScenario::NotFound);
+        engine.fail_next_network_create();
+        let runtime = runtime(&engine);
+
+        let err = runtime
+            .create_network("app-salmon-net-01ABC")
+            .await
+            .expect_err("create network fails");
+        assert!(matches!(
+            err,
+            crate::ports::container_runtime::DockerError::CreateNetwork { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_network_succeeds() {
+        let engine = FakeDockerEngine::start(InspectScenario::NotFound);
+        let runtime = runtime(&engine);
+
+        runtime
+            .remove_network(&NetworkHandle::new("app-salmon-net-01ABC"))
+            .await
+            .expect("remove network succeeds");
+    }
+
+    #[tokio::test]
+    async fn remove_network_is_idempotent_on_already_removed_network() {
+        let engine = FakeDockerEngine::start(InspectScenario::NotFound);
+        engine.network_remove_returns_not_found();
+        let runtime = runtime(&engine);
+
+        runtime
+            .remove_network(&NetworkHandle::new("app-salmon-net-01ABC"))
+            .await
+            .expect("404 on network remove is treated as success");
+    }
+
+    #[tokio::test]
+    async fn remove_network_reports_a_genuine_server_error_rather_than_treating_it_as_not_found() {
+        let engine = FakeDockerEngine::start(InspectScenario::NotFound);
+        engine.network_remove_returns_server_error();
+        let runtime = runtime(&engine);
+
+        let err = runtime
+            .remove_network(&NetworkHandle::new("app-salmon-net-01ABC"))
+            .await
+            .expect_err("a genuine 500 must not be swallowed as success");
+        assert!(matches!(
+            err,
+            crate::ports::container_runtime::DockerError::RemoveNetwork { .. }
+        ));
     }
 }

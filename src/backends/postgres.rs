@@ -30,7 +30,7 @@ use crate::domain::ids::{ClusterId, WorkerUser};
 use crate::domain::service_kind::{ConnectionInfo, ServiceKind, ServiceSpec};
 use crate::ports::container_runtime::{
     BindMount, ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, DockerError,
-    HealthCheck, HealthState,
+    HealthCheck, HealthState, OciRuntime,
 };
 use crate::ports::secrets::SecretGenerator;
 use crate::redacted::Redacted;
@@ -275,6 +275,8 @@ impl ClusterBackend for PostgresBackend {
                 timeout: HEALTHCHECK_PROBE_TIMEOUT,
                 retries: HEALTHCHECK_RETRIES,
             }),
+            runtime: OciRuntime::Runc,
+            network: None,
         };
 
         let handle = self.container_runtime.create_and_start(&spec).await?;
@@ -401,6 +403,21 @@ mod tests {
 
         async fn stop_and_remove(&self, handle: &ContainerHandle) -> Result<(), DockerError> {
             self.removed.lock().expect("lock").push(handle.clone());
+            Ok(())
+        }
+
+        async fn create_network(
+            &self,
+            name: &str,
+        ) -> Result<crate::ports::container_runtime::NetworkHandle, DockerError> {
+            // PostgresBackend never requests a network attachment — unexercised by design here.
+            Ok(crate::ports::container_runtime::NetworkHandle::new(name))
+        }
+
+        async fn remove_network(
+            &self,
+            _handle: &crate::ports::container_runtime::NetworkHandle,
+        ) -> Result<(), DockerError> {
             Ok(())
         }
     }
