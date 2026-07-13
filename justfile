@@ -58,3 +58,10 @@ run config="config.toml":
 # postgres image). Needs root.
 setup-e2e:
     sudo ./scripts/setup-e2e-env.sh
+
+# Run the e2e suite inside an ephemeral, disposable QEMU VM instead of on this machine directly
+# — so setup-e2e's useradd/sudoers.d writes and the e2e suite's Docker usage land on a throwaway
+# guest, not here. Needs QEMU + KVM access (see scripts/vm/run-e2e-in-vm.sh's header for exact
+# host prerequisites); does NOT need root, Docker, or setup-e2e to have been run on this machine.
+test-e2e-vm *args:
+    ./scripts/vm/run-e2e-in-vm.sh {{ args }}

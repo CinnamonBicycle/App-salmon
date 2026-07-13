@@ -221,3 +221,6 @@ __marimo__/
 # Added by cargo
 
 /target
+
+# Written by scripts/vm/run-e2e-in-vm.sh's guest, read back by the host script.
+/.e2e-vm-result/

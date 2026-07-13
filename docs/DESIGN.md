@@ -387,6 +387,92 @@ kept in sync by hand:**
   row. Not fixed here (no reproduction, no test infrastructure currently writes corrupt rows) —
   flagged for awareness, not treated as a phase-1 blocker.
 
+## 8b. VM e2e testing — `just test-e2e-vm`
+
+`scripts/setup-e2e-env.sh` (per §8) makes real, host-level changes: it creates system Unix
+accounts and writes an `/etc/sudoers.d` rule. Requiring that on every machine that wants to run
+the e2e suite — including a disposable CI runner or a developer's own laptop — is a real cost,
+and the earlier design left no way to run the e2e suite *without* accepting it. `just
+test-e2e-vm` (→ `scripts/vm/run-e2e-in-vm.sh`) closes that gap: it runs the entire e2e suite,
+including `setup-e2e-env.sh` itself, inside an ephemeral QEMU VM booted from a stock Ubuntu cloud
+image, and discards the VM's disk when the run finishes. The invoking host needs QEMU + `/dev/kvm`
+access, but never runs `useradd`, never writes to its own `/etc/sudoers.d`, and never needs a
+Docker daemon of its own.
+
+**Design:**
+- `scripts/vm/run-e2e-in-vm.sh` (host side): downloads the official Ubuntu 24.04 (`noble`) server
+  cloud image once, caches it under `~/.cache/app-salmon-e2e-vm/`, and **re-verifies its SHA-256
+  against the vendor's published `SHA256SUMS` on every run** (not a checksum hardcoded once in
+  this script, which would silently go stale as Ubuntu republishes the `current` image) —
+  redownloads once and re-checks if the cached copy ever fails to match. Creates a copy-on-write
+  qcow2 overlay backed by that cached image (`qemu-img create -f qcow2 -F qcow2 -b <base>
+  overlay.qcow2 20G`) so the cached base image itself is never written to. Builds a `cidata`
+  (NoCloud) cloud-init seed ISO via whichever of `cloud-localds` / `genisoimage` / `mkisofs` /
+  `xorriso -as genisoimage` is on `PATH`. Boots with `-machine q35,accel=kvm -cpu host`, a
+  `virtio-net` user-mode NIC (outbound only, for `apt`/`docker pull`/`rustup`), and a `-virtfs
+  local` 9p share exposing the repo checkout read-write at `/repo` inside the guest — the same
+  checkout the host is running from, not a copy. Waits on the qemu process under a `timeout`
+  (default 1800s), then reads the guest's result back from `<repo>/.e2e-vm-result/` (which is
+  simply a subdirectory of the same 9p share, so both sides see it without any extra transport).
+- `scripts/vm/guest-init.sh` (guest side, run as root via cloud-init `runcmd`): mounts the 9p
+  share at `/repo`, installs `docker.io` and a build toolchain via `apt`, installs Rust via
+  `rustup` for the cloud image's default `ubuntu` user, runs `APP_SALMON_USER=ubuntu
+  scripts/setup-e2e-env.sh` — so the invasive host changes §8 describes land on *this disposable
+  guest*, exactly once, and are thrown away with the VM's disk — then runs `cargo test --test
+  e2e -- --test-threads=1` as `ubuntu` (the same command `just test-e2e` runs; called directly
+  here rather than through `just` itself, since `just` isn't guaranteed present in every Ubuntu
+  release's default repos and this is the one place avoiding that dependency was worth the small
+  duplication), and writes its exit code and full test log to `/repo/.e2e-vm-result/`. An
+  `EXIT` trap guarantees the guest always powers off and always leaves an `exit_code` file
+  behind, however the script exits — including a failure before the test run even starts (a bad
+  apt mirror, a rustup network hiccup, the 9p mount itself) — specifically so a pre-test failure
+  surfaces as "failed in a couple of minutes with a log to read" on the host side rather than
+  "the host blocks for the full `--timeout` with no explanation." The VM's own poweroff is what
+  makes the host's `qemu-system-x86_64` process exit and the host script proceed to read the
+  result.
+- **Why not nested virtualization:** phase-1 e2e only needs plain Docker (runc containers, i.e.
+  Linux namespaces + cgroups in the guest kernel) — one level of hardware virtualization
+  (`-enable-kvm`/`accel=kvm`) is sufficient and is all this tooling requires or configures.
+  Nested virtualization (`kvm_intel`/`kvm_amd`'s `nested=1` module parameter) only becomes
+  necessary once the *guest itself* needs to run a second-level hypervisor — that's the
+  Kata-Containers phase (§7c), not this one. Building today's tooling to require nested virt now
+  would make it fail on hosts that don't have that host-kernel module setting even though nothing
+  it currently runs needs it; the same QEMU invocation carries forward unchanged into the Kata
+  phase, at which point only a host-side module flag changes, not this script.
+
+**Verification status — read before trusting this beyond "the pieces are individually sound":**
+this sandbox has no `/dev/kvm` access (confirmed: this user isn't in the `kvm` group, a direct
+open of `/dev/kvm` is denied, and there's no passwordless sudo available to fix either) — so
+**no VM has actually been booted in any session so far.** What *was* verified in this sandbox,
+directly rather than by inspection:
+- Both scripts are `bash -n`-clean.
+- The generated cloud-init `user-data`/`meta-data` were parsed with a real YAML parser
+  (`python3` + `PyYAML`), including base64-decoding the embedded `guest-init.sh` and confirming
+  it round-trips byte-for-byte.
+- Every QEMU flag used (`-machine q35,accel=kvm|tcg`, `-cpu`, `-smp`, `-no-reboot`, `-display
+  none`, `-serial file:...`, `-drive ...,if=virtio`, `-netdev user` + `virtio-net-pci`, `-virtfs
+  local,...,security_model=none`) was checked against this machine's actual `qemu-system-x86_64
+  --help` / `-device help` / `-accel help` output, and **the exact command line this script
+  builds was run against real (throwaway) disk/ISO files**, with `accel=tcg` substituted for
+  `accel=kvm` and `-cpu qemu64` substituted for `-cpu host` (both real-run values require KVM,
+  which this sandbox doesn't have) — every other flag was passed through unchanged, and QEMU
+  accepted the full command line and started successfully before being killed. `accel=kvm` and
+  `-cpu host` themselves were not, and could not be, exercised here.
+- `qemu-img create -f qcow2 -F qcow2 -b <base> <overlay> 20G` was run for real against a scratch
+  backing file and produces a correctly-sized, correctly-backed overlay (`qemu-img info`
+  confirms `backing file`/`backing file format`/`virtual size`).
+- The base image URL and its `SHA256SUMS` companion were fetched for real from
+  `cloud-images.ubuntu.com` in this sandbox and do resolve/match as this script expects.
+
+What is **not** verified, because it requires either KVM or root this sandbox doesn't have:
+whether the guest actually boots this cloud image under `accel=kvm`, whether cloud-init actually
+runs `write_files`/`runcmd` as configured, whether the 9p mount actually comes up inside the
+guest, whether `apt`/`rustup`/`just test-e2e` actually succeed inside it, and whether
+`scripts/setup-e2e-env.sh` behaves the same inside this specific cloud image as it does on a bare
+host. The first session with real `/dev/kvm` access should run `just test-e2e-vm` against a
+scratch checkout and treat whatever it finds as a bug report against this section — same posture
+already established for the e2e suite itself in §8a.
+
 ## 9. Testing & coverage
 
 - `just ci` — the single command: format check, clippy (deny-on-warnings, `--all-targets
@@ -396,6 +482,9 @@ kept in sync by hand:**
   to leave e2e unrun, not to fail).
 - `just test-unit` / `just test-e2e` / `just test-all` — independently runnable, per the
   requirement that unit and e2e stay separable.
+- `just test-e2e-vm` — runs the same e2e suite inside a disposable QEMU VM instead of on this
+  machine, so `setup-e2e-env.sh`'s host-level changes never touch the machine actually running the
+  tooling; see §8b for the design and its verification status.
 - `just coverage` (needs `cargo install cargo-llvm-cov` + `rustup component add
   llvm-tools-preview` once per machine) — measures the **entire** `--lib` target, no
   `--ignore-filename-regex` carve-out for adapters. Current state (2026-07-12): 96.2% region /
