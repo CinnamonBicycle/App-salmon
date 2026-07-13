@@ -12,6 +12,7 @@ use app_salmon::adapters::system_clock::SystemClock;
 use app_salmon::adapters::system_users::{self, WorkerResolutionError};
 use app_salmon::backends::ClusterBackend;
 use app_salmon::backends::postgres::PostgresBackend;
+use app_salmon::backends::supabase::SupabaseBackend;
 use app_salmon::client_workers::ClientWorkers;
 use app_salmon::config::{Config, ConfigError};
 use app_salmon::domain::ids::ClientId;
@@ -34,7 +35,7 @@ const LOG_COMPRESS_AFTER: Duration = Duration::from_hours(24);
 #[derive(Parser)]
 #[command(
     name = "app_salmon",
-    about = "Provisions ephemeral Postgres+pgvector clusters for integration tests"
+    about = "Provisions ephemeral Postgres+pgvector or Supabase clusters for integration tests"
 )]
 struct Cli {
     /// Path to the TOML config file.
@@ -154,12 +155,12 @@ async fn build_task_deps(
         "resolved configured clients' unix accounts"
     );
 
-    // TODO(§7a+§7c M4/M5): "kata" is a placeholder until `[supabase].kata_runtime_name` config
-    // lands — see docs/DESIGN.md §11. Matches what scripts/vm/guest-provision.sh registers it as.
+    // Matches what scripts/vm/guest-provision.sh registers Kata as in the guest's Docker
+    // daemon.json — see docs/DESIGN.md §11's cross-artifact invariant note.
     let container_runtime = Arc::new(BollardContainerRuntime::connect(
         &config.docker.socket_path,
         10,
-        "kata",
+        config.supabase.kata_runtime_name.clone(),
     )?);
     let privileged_exec = Arc::new(SudoExecutor::new("sudo", Duration::from_secs(30)));
     let storage_dir_base = config
@@ -169,16 +170,30 @@ async fn build_task_deps(
         .unwrap_or_else(|| Path::new("."));
     let worker_data_dir_base = storage_dir_base.join("workers");
     let tar_staging_dir_base = storage_dir_base.join("tar-staging");
+    let kong_config_dir_base = storage_dir_base.join("kong-config");
 
     let postgres_backend = Arc::new(PostgresBackend::new(
-        container_runtime,
+        container_runtime.clone(),
         secrets.clone(),
         config.docker.postgres_image.clone(),
         worker_data_dir_base.clone(),
         Duration::from_secs(config.limits.health_check_timeout_secs),
     ));
+    let supabase_backend = Arc::new(SupabaseBackend::new(
+        container_runtime,
+        secrets.clone(),
+        config.docker.postgres_image.clone(),
+        config.supabase.postgrest_image.clone(),
+        config.supabase.gotrue_image.clone(),
+        config.supabase.kong_image.clone(),
+        config.supabase.edge_runtime_image.clone(),
+        worker_data_dir_base.clone(),
+        kong_config_dir_base,
+        Duration::from_secs(config.limits.health_check_timeout_secs),
+    ));
     let mut backends: HashMap<ServiceKind, Arc<dyn ClusterBackend>> = HashMap::new();
     backends.insert(ServiceKind::Postgres, postgres_backend);
+    backends.insert(ServiceKind::Supabase, supabase_backend);
 
     let task_deps = Arc::new(TaskDeps {
         repository: repository.clone(),

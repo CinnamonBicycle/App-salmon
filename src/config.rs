@@ -84,8 +84,32 @@ pub struct LimitsConfig {
 pub struct DockerConfig {
     /// Filesystem path to the Docker Engine API's Unix domain socket.
     pub socket_path: String,
-    /// The Postgres/pgvector image reference to run for each cluster.
+    /// The Postgres/pgvector image reference to run for each cluster. Also used as
+    /// `ServiceKind::Supabase`'s `db` container image — Supabase doesn't get a separate one, per
+    /// `docs/DESIGN.md` §11.
     pub postgres_image: String,
+}
+
+/// `[supabase]` — images for the four non-Postgres containers a `ServiceKind::Supabase` cluster
+/// runs, plus the name Kata is registered under in the guest's Docker `daemon.json`. Required
+/// alongside `[docker]`, matching this project's no-silent-partial-config convention — see
+/// `docs/DESIGN.md` §11.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupabaseConfig {
+    /// The `PostgREST` image reference to run for each Supabase cluster's `rest` container.
+    pub postgrest_image: String,
+    /// The `GoTrue` image reference to run for each Supabase cluster's `auth` container.
+    pub gotrue_image: String,
+    /// The Kong image reference to run for each Supabase cluster's `kong` container.
+    pub kong_image: String,
+    /// The edge-function runtime image reference to run for each Supabase cluster's `functions`
+    /// container (under Kata — see [`crate::ports::container_runtime::OciRuntime::Kata`]).
+    pub edge_runtime_image: String,
+    /// The name Kata is registered under in the guest's `/etc/docker/daemon.json` `"runtimes"`
+    /// map (see `scripts/vm/guest-provision.sh`) — a cross-artifact invariant, like the ones
+    /// `docs/DESIGN.md` §8a already documents for other config values that must match something
+    /// outside this file.
+    pub kata_runtime_name: String,
 }
 
 /// `[storage]` — where durable cluster state is persisted.
@@ -135,6 +159,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// `[docker]` settings.
     pub docker: DockerConfig,
+    /// `[supabase]` settings.
+    pub supabase: SupabaseConfig,
     /// `[storage]` settings.
     pub storage: StorageConfig,
     /// `[logging]` settings.
@@ -294,6 +320,13 @@ max_tar_entry_bytes = 10485760
 socket_path = "/var/run/docker.sock"
 postgres_image = "pgvector/pgvector:pg16"
 
+[supabase]
+postgrest_image = "postgrest/postgrest:v12"
+gotrue_image = "supabase/gotrue:v2"
+kong_image = "kong:3"
+edge_runtime_image = "supabase/edge-runtime:v1"
+kata_runtime_name = "kata"
+
 [storage]
 sqlite_path = "/var/lib/app_salmon/state.sqlite3"
 
@@ -397,6 +430,22 @@ unix_user = "openbrain-agent"
             &toml_str[..toml_str.find("[[clients]]").expect("has clients section")];
         let err = parse(without_clients).expect_err("invalid");
         assert!(matches!(err, super::ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn rejects_a_missing_supabase_section() {
+        let toml_str = valid_toml();
+        let without_supabase = format!(
+            "{}{}",
+            &toml_str[..toml_str.find("[supabase]").expect("has supabase section")],
+            &toml_str[toml_str.find("[storage]").expect("has storage section")..]
+        );
+        let result: Result<super::Config, super::ConfigError> = toml::from_str(&without_supabase)
+            .map_err(|source| super::ConfigError::Parse {
+                path: "test.toml".into(),
+                source: Box::new(source),
+            });
+        assert!(matches!(result, Err(super::ConfigError::Parse { .. })));
     }
 
     #[test]

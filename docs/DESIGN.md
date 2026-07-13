@@ -999,9 +999,28 @@ All three are fake-tested (a new `PortPublish::Unpublished` case in `docker_boll
 suite; `health_wait`'s widened test coverage) but, like the rest of M4b, not proof the real
 containers behave as intended — that's still M6.
 
+### M5 — wired into the registry: done
+
+New `[supabase]` config table (`postgrest_image`, `gotrue_image`, `kong_image`,
+`edge_runtime_image`, `kata_runtime_name`) — required alongside `[docker]`, matching this
+project's no-silent-partial-config convention (a missing `[supabase]` section fails to parse at
+startup, the same as a missing `[docker]` section always has). `main.rs` now constructs
+`SupabaseBackend` from it and registers it in the same `backends` map `PostgresBackend` was
+already in — `ServiceKind::Supabase` requests route through the real backend now, not the
+"no backend registered" `Failed` path M2/M3/M4 deliberately left it in.
+
+`kata_runtime_name` closes the cross-artifact placeholder from M0/M4a: `main.rs` no longer hard-codes
+`"kata"` when connecting `BollardContainerRuntime` — it comes from config, which
+`scripts/vm/guest-provision.sh`'s own registration must continue to match (same invariant class
+`docs/DESIGN.md` §8a already documents elsewhere). `db`'s image is deliberately *not* duplicated
+into `[supabase]` — `SupabaseBackend` reuses `[docker].postgres_image`, the same image
+`PostgresBackend` runs, per the M4b design note that Supabase's `db` isn't a separate image.
+
 ### Not yet built
 
-M5 (wiring `SupabaseBackend` into the backend registry alongside `PostgresBackend`, plus the
-`[supabase]` config table `main.rs` needs to construct it) and M6 (real e2e verification of the
-whole stack — including a genuine tar-supplied edge function executing under Kata — in the VM,
-where the M4b placeholders above get corrected against reality).
+M6: real e2e verification of the whole stack against the actual VM — Postgres+pgvector alone under
+the new backend path first, then +PostgREST+GoTrue (inter-container DNS-by-alias, new territory),
+then +Kong (ingress), then the edge-function container under real Kata with a genuinely
+tar-supplied function actually executing. This is where every M4b placeholder (container ports,
+env var names, the edge-runtime mount-path convention) and the M4b-review fixes (health-wait
+semantics, `PortPublish`, `functions` worker-ownership) get checked against reality, not assumed.
