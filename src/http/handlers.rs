@@ -260,13 +260,15 @@ fn info_response(
 ///
 /// - `state`: the application state to pull `task_deps`/`task_registry` from.
 /// - `cluster`: the newly created cluster (still in `Spawning` state) to provision.
-fn launch_spawn(state: &AppState, cluster: Cluster) {
+/// - `project_tar`: the raw bytes of a caller-uploaded project tree, if any — see
+///   [`crate::service::spawn_task::run`].
+fn launch_spawn(state: &AppState, cluster: Cluster, project_tar: Option<Vec<u8>>) {
     let cluster_id = cluster.id;
     let cancel = state.task_registry.register(cluster_id);
     let deps = state.task_deps.clone();
     let registry = state.task_registry.clone();
     tokio::spawn(async move {
-        spawn_task::run(deps, cluster, cancel).await;
+        spawn_task::run(deps, cluster, cancel, project_tar).await;
         registry.unregister(&cluster_id);
     });
 }
@@ -277,9 +279,10 @@ fn launch_spawn(state: &AppState, cluster: Cluster) {
 /// layer on this route (see `http::router`), which surfaces as a multipart read error mid-stream
 /// — rather than passed further into the system.
 ///
-/// Nothing downstream yet consumes `project_tar`'s bytes: they're read (so the size limit is
-/// actually enforced) and dropped once this function returns. Extracting and validating the
-/// tar's contents is `SupabaseBackend`'s job, not this HTTP layer's — see `docs/DESIGN.md` §11.
+/// This layer only enforces the wire-size cap; it never inspects `project_tar`'s structure —
+/// that validation happens exactly once, downstream, at the point that actually has a
+/// destination to extract into (`service::spawn_task::adopt_project_tar`, called from
+/// `do_spawn` once the cluster's worker/slot directory exists — see `docs/DESIGN.md` §11 for why).
 ///
 /// # Arguments
 ///
@@ -288,7 +291,8 @@ fn launch_spawn(state: &AppState, cluster: Cluster) {
 /// # Returns
 ///
 /// The parsed `metadata` part, once both parts have been read and `service` is confirmed to be
-/// [`ServiceKind::Supabase`] (the only kind this path accepts).
+/// [`ServiceKind::Supabase`] (the only kind this path accepts), together with `project_tar`'s raw
+/// bytes.
 ///
 /// # Errors
 ///
@@ -297,9 +301,9 @@ fn launch_spawn(state: &AppState, cluster: Cluster) {
 /// malformed or exceeds the configured size limit.
 async fn parse_multipart_create_request(
     mut multipart: Multipart,
-) -> Result<CreateClusterRequest, ApiError> {
+) -> Result<(CreateClusterRequest, Vec<u8>), ApiError> {
     let mut metadata: Option<CreateClusterRequest> = None;
-    let mut saw_project_tar = false;
+    let mut project_tar: Option<Vec<u8>> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -316,10 +320,10 @@ async fn parse_multipart_create_request(
                 })?);
             }
             Some("project_tar") => {
-                field.bytes().await.map_err(|err| {
+                let bytes = field.bytes().await.map_err(|err| {
                     ApiError::BadRequest(format!("invalid multipart body: {err}"))
                 })?;
-                saw_project_tar = true;
+                project_tar = Some(bytes.to_vec());
             }
             _ => {}
         }
@@ -328,18 +332,16 @@ async fn parse_multipart_create_request(
     let metadata = metadata.ok_or_else(|| {
         ApiError::BadRequest("multipart request missing a \"metadata\" part".to_string())
     })?;
-    if !saw_project_tar {
-        return Err(ApiError::BadRequest(
-            "multipart request missing a \"project_tar\" part".to_string(),
-        ));
-    }
+    let project_tar = project_tar.ok_or_else(|| {
+        ApiError::BadRequest("multipart request missing a \"project_tar\" part".to_string())
+    })?;
     if metadata.service != ServiceKind::Supabase {
         return Err(ApiError::BadRequest(
             "multipart/form-data requests are only accepted for service \"supabase\"".to_string(),
         ));
     }
 
-    Ok(metadata)
+    Ok((metadata, project_tar))
 }
 
 /// Validates and accepts a new cluster request, then launches its background provisioning task.
@@ -394,11 +396,12 @@ pub async fn create_cluster(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("multipart/form-data"));
 
-    let request = if is_multipart {
+    let (request, project_tar) = if is_multipart {
         let multipart = Multipart::from_request(request, &state)
             .await
             .map_err(|err| ApiError::BadRequest(format!("invalid multipart body: {err}")))?;
-        parse_multipart_create_request(multipart).await?
+        let (request, project_tar) = parse_multipart_create_request(multipart).await?;
+        (request, Some(project_tar))
     } else {
         let Json(body) = Json::<CreateClusterRequest>::from_request(request, &state)
             .await
@@ -410,7 +413,7 @@ pub async fn create_cluster(
                     .to_string(),
             ));
         }
-        body
+        (body, None)
     };
 
     let ttl = TimeDelta::try_seconds(request.ttl_secs)
@@ -425,7 +428,7 @@ pub async fn create_cluster(
     let estimated_ready_at = requested_at + state.spawn_estimate;
     let id = cluster.id.to_string();
 
-    launch_spawn(&state, cluster);
+    launch_spawn(&state, cluster, project_tar);
 
     let body = CreateClusterResponse {
         id,

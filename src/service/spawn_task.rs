@@ -15,10 +15,128 @@ use tokio_util::sync::CancellationToken;
 use crate::client_workers::{ClientWorkerError, worker_data_dir};
 use crate::domain::cluster::{Cluster, ClusterError, ClusterEvent, ClusterState, transition};
 use crate::domain::service_kind::ConnectionInfo;
+use crate::domain::tar_validation::{self, TarValidationError};
 use crate::ports::container_runtime::DockerError;
 use crate::ports::privileged_exec::PrivilegedCommand;
 use crate::service::deps::TaskDeps;
 use crate::service::teardown_task;
+
+/// The fixed name of the worker-owned subdirectory an uploaded `project_tar` is adopted into —
+/// see [`crate::backends::ClusterBackend::worker_subdirs`]. A backend that accepts an uploaded
+/// tree (currently only `SupabaseBackend`) must include this exact name in its declared
+/// `worker_subdirs()` for [`adopt_project_tar`] to have anywhere worker-owned to copy into.
+const PROJECT_SUBDIR: &str = "project";
+
+/// Maps a [`TarValidationError`] to a caller-facing summary safe to persist/return — never the
+/// error's own `Display` text, which echoes back paths taken directly from the caller's own
+/// upload (not a leak of *other* callers' data, but needlessly detailed for an API response).
+///
+/// # Arguments
+///
+/// - `error`: the validation failure to summarize.
+///
+/// # Returns
+///
+/// A short, sanitized summary naming which broad category of problem was found.
+fn sanitize_tar_error(error: &TarValidationError) -> String {
+    match error {
+        TarValidationError::DisallowedEntryType { .. } => {
+            "project_tar contains an entry type that isn't allowed (only regular files and \
+             directories are)"
+                .to_string()
+        }
+        TarValidationError::EntryTooLarge { .. } | TarValidationError::TotalTooLarge { .. } => {
+            "project_tar exceeds the configured size limit".to_string()
+        }
+        TarValidationError::UnsafeEntry { .. } => {
+            "project_tar contains an entry with an unsafe path".to_string()
+        }
+        TarValidationError::Read { .. } | TarValidationError::Extract { .. } => {
+            "project_tar could not be read or extracted".to_string()
+        }
+    }
+}
+
+/// Validates and extracts `tar_bytes` into an `app_salmon`-owned staging directory, then hands it
+/// off to a privileged copy (see [`crate::ports::privileged_exec::PrivilegedCommand::AdoptStagedTree`])
+/// so it lands worker-owned at `<worker's slot dir>/project` — the conventional subdirectory a
+/// backend that wants the uploaded tree declares via `worker_subdirs()` (see [`PROJECT_SUBDIR`]).
+/// Runs before any backend `spawn()` call, so a malformed upload is rejected before any container
+/// is created (see `docs/DESIGN.md` §11).
+///
+/// # Arguments
+///
+/// - `deps`: shared task dependencies — `tar_staging_dir_base`/`tar_limits` for validation,
+///   `privileged_exec` for the worker-owned copy.
+/// - `cluster_id`: used to name this attempt's staging subdirectory uniquely.
+/// - `worker`: the worker account to run the privileged copy as.
+/// - `dest`: the pre-existing, worker-owned destination directory to copy the extracted tree
+///   into — must already exist (via a prior `PrepareWorkerDir`).
+/// - `tar_bytes`: the raw, not-yet-validated tar archive bytes.
+///
+/// # Returns
+///
+/// Nothing, on success — the extracted tree is now at `dest`, and the staging directory has been
+/// removed.
+///
+/// # Errors
+///
+/// [`ClusterError::BackendSpawnFailed`] if the staging directory can't be created, `tar_bytes`
+/// fails validation (see [`sanitize_tar_error`]), or the extraction task itself panics; otherwise
+/// propagates whatever [`ClientWorkerError`] the privileged copy step produces. The staging
+/// directory is removed on a best-effort basis regardless of outcome (a cleanup failure is logged,
+/// not fatal — matching this project's established "log, don't fail the caller over cleanup"
+/// convention, e.g. `teardown_task`'s wipe-failure handling).
+async fn adopt_project_tar(
+    deps: &TaskDeps,
+    cluster_id: &crate::domain::ids::ClusterId,
+    worker: &crate::domain::ids::WorkerUser,
+    dest: &std::path::Path,
+    tar_bytes: &[u8],
+) -> Result<(), ClusterError> {
+    let staging = deps.tar_staging_dir_base.join(cluster_id.to_string());
+    tokio::fs::create_dir_all(&staging)
+        .await
+        .map_err(|_source| {
+            ClusterError::BackendSpawnFailed("failed to prepare staging directory".to_string())
+        })?;
+
+    let limits = deps.tar_limits;
+    let tar_bytes = tar_bytes.to_vec();
+    let staging_for_extract = staging.clone();
+    let extract_result = tokio::task::spawn_blocking(move || {
+        tar_validation::validate_and_extract(&tar_bytes, &staging_for_extract, &limits)
+    })
+    .await;
+
+    let outcome = match extract_result {
+        Ok(Ok(())) => deps
+            .privileged_exec
+            .run_as(
+                worker,
+                PrivilegedCommand::AdoptStagedTree {
+                    staging_path: staging.display().to_string(),
+                    dest_path: dest.display().to_string(),
+                },
+            )
+            .await
+            .map(|_output| ())
+            .map_err(ClientWorkerError::Prepare)
+            .map_err(ClusterError::from),
+        Ok(Err(validation_error)) => Err(ClusterError::BackendSpawnFailed(sanitize_tar_error(
+            &validation_error,
+        ))),
+        Err(_join_error) => Err(ClusterError::BackendSpawnFailed(
+            "internal error while extracting project_tar".to_string(),
+        )),
+    };
+
+    if let Err(error) = tokio::fs::remove_dir_all(&staging).await {
+        tracing::warn!(cluster_id = %cluster_id, error = %error, "failed to remove tar staging directory; leaking disk space, not failing the spawn over it");
+    }
+
+    outcome
+}
 
 /// Maps an internal spawn failure to a coarse, user-facing summary safe to persist on the
 /// cluster's `Failed` state and return from the API — never the raw error's `Display` text, which
@@ -63,6 +181,10 @@ fn sanitize(error: &ClusterError) -> String {
 ///   registered backends, clock, worker data directory base).
 /// - `cluster`: the cluster being spawned; mutated in place to record the resolved `worker` once
 ///   it's known, so the caller can use it for cleanup even if a later step fails.
+/// - `project_tar`: the raw bytes of a caller-uploaded project tree (see `http::handlers`'s
+///   `multipart/form-data` path), if any — kind-agnostic here (any backend that declares
+///   `worker_subdirs()` including [`PROJECT_SUBDIR`] can receive one; currently only
+///   `SupabaseBackend` does).
 ///
 /// # Returns
 ///
@@ -71,11 +193,16 @@ fn sanitize(error: &ClusterError) -> String {
 /// # Errors
 ///
 /// Returns [`ClusterError::BackendSpawnFailed`] if no backend is registered for the cluster's
-/// service kind, a [`crate::client_workers::ClientWorkerError`] (via `#[from]`) if the owner has
-/// no configured account or the privileged directory-preparation command fails, or whatever error
-/// the backend's own `spawn` call produces (including [`ClusterError::Repository`] if persisting
-/// the resolved worker fails).
-async fn do_spawn(deps: &TaskDeps, cluster: &mut Cluster) -> Result<ConnectionInfo, ClusterError> {
+/// service kind, if `project_tar` is present but fails validation (see [`adopt_project_tar`]), a
+/// [`crate::client_workers::ClientWorkerError`] (via `#[from]`) if the owner has no configured
+/// account or a privileged directory-preparation/adopt command fails, or whatever error the
+/// backend's own `spawn` call produces (including [`ClusterError::Repository`] if persisting the
+/// resolved worker fails).
+async fn do_spawn(
+    deps: &TaskDeps,
+    cluster: &mut Cluster,
+    project_tar: Option<&[u8]>,
+) -> Result<ConnectionInfo, ClusterError> {
     let backend = deps
         .backends
         .get(&cluster.service.kind)
@@ -90,16 +217,35 @@ async fn do_spawn(deps: &TaskDeps, cluster: &mut Cluster) -> Result<ConnectionIn
     cluster.worker = Some(worker.clone());
     deps.repository.set_worker(&cluster.id, &worker).await?;
 
-    let path = worker_data_dir(&deps.worker_data_dir_base, &worker, cluster.slot);
-    deps.privileged_exec
-        .run_as(
+    let base = worker_data_dir(&deps.worker_data_dir_base, &worker, cluster.slot);
+    let subdirs = backend.worker_subdirs();
+    let prepare_targets: Vec<std::path::PathBuf> = if subdirs.is_empty() {
+        vec![base.clone()]
+    } else {
+        subdirs.iter().map(|subdir| base.join(subdir)).collect()
+    };
+    for target in &prepare_targets {
+        deps.privileged_exec
+            .run_as(
+                &worker,
+                PrivilegedCommand::PrepareWorkerDir {
+                    path: target.display().to_string(),
+                },
+            )
+            .await
+            .map_err(ClientWorkerError::Prepare)?;
+    }
+
+    if let Some(tar_bytes) = project_tar {
+        adopt_project_tar(
+            deps,
+            &cluster.id,
             &worker,
-            PrivilegedCommand::PrepareWorkerDir {
-                path: path.display().to_string(),
-            },
+            &base.join(PROJECT_SUBDIR),
+            tar_bytes,
         )
-        .await
-        .map_err(ClientWorkerError::Prepare)?;
+        .await?;
+    }
 
     backend
         .spawn(&cluster.id, &worker, cluster.slot, &cluster.service)
@@ -121,11 +267,17 @@ async fn do_spawn(deps: &TaskDeps, cluster: &mut Cluster) -> Result<ConnectionIn
 ///   from this local copy, before writing a final outcome.
 /// - `cancel`: signaled by the HTTP layer if a `DELETE` arrives for this cluster while it's still
 ///   registered as in-flight.
-pub async fn run(deps: Arc<TaskDeps>, mut cluster: Cluster, cancel: CancellationToken) {
+/// - `project_tar`: the raw bytes of a caller-uploaded project tree, if any — see [`do_spawn`].
+pub async fn run(
+    deps: Arc<TaskDeps>,
+    mut cluster: Cluster,
+    cancel: CancellationToken,
+    project_tar: Option<Vec<u8>>,
+) {
     let outcome = tokio::select! {
         biased;
         () = cancel.cancelled() => None,
-        result = do_spawn(&deps, &mut cluster) => Some(result),
+        result = do_spawn(&deps, &mut cluster, project_tar.as_deref()) => Some(result),
     };
 
     let Some(spawn_result) = outcome else {
@@ -203,7 +355,7 @@ pub async fn run(deps: Arc<TaskDeps>, mut cluster: Cluster, cancel: Cancellation
 
 #[cfg(test)]
 mod tests {
-    use super::{run, sanitize};
+    use super::{do_spawn, run, sanitize};
     use crate::backends::ClusterBackend;
     use crate::client_workers::{ClientWorkerError, ClientWorkers};
     use crate::domain::cluster::{Cluster, ClusterError, ClusterState, DeleteReason};
@@ -281,6 +433,113 @@ mod tests {
         }
     }
 
+    /// A backend that declares configurable `worker_subdirs()` and always spawns successfully —
+    /// used to test `do_spawn`'s subdirectory-preparation and tar-adoption orchestration in
+    /// isolation from `ScriptedBackend`'s (default, no-subdirs) existing test coverage.
+    struct SubdirDeclaringBackend {
+        subdirs: &'static [&'static str],
+    }
+
+    #[async_trait]
+    impl ClusterBackend for SubdirDeclaringBackend {
+        fn kind(&self) -> ServiceKind {
+            ServiceKind::Postgres
+        }
+
+        fn worker_subdirs(&self) -> &[&'static str] {
+            self.subdirs
+        }
+
+        async fn spawn(
+            &self,
+            _cluster_id: &ClusterId,
+            _worker: &WorkerUser,
+            _slot: u32,
+            _service: &ServiceSpec,
+        ) -> Result<ConnectionInfo, ClusterError> {
+            Ok(ConnectionInfo::Postgres(PostgresConnectionInfo {
+                host: "127.0.0.1".to_string(),
+                port: 55432,
+                dbname: "app_salmon".to_string(),
+                user: "app_salmon".to_string(),
+                password: Redacted::new("hunter2".to_string()),
+            }))
+        }
+
+        async fn teardown(&self, _cluster_id: &ClusterId) -> Result<(), ClusterError> {
+            Ok(())
+        }
+
+        async fn is_alive(&self, _cluster_id: &ClusterId) -> Result<bool, ClusterError> {
+            unreachable!("these tests never call is_alive")
+        }
+    }
+
+    /// Records every `PrivilegedCommand` it's asked to run, in order, and always succeeds —
+    /// used to assert exactly which privileged operations `do_spawn` issues and with what
+    /// arguments, rather than just that it doesn't error.
+    #[derive(Default)]
+    struct RecordingExecutor {
+        calls: std::sync::Mutex<Vec<PrivilegedCommand>>,
+    }
+
+    impl RecordingExecutor {
+        fn calls(&self) -> Vec<PrivilegedCommand> {
+            self.calls.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl PrivilegedExecutor for RecordingExecutor {
+        async fn run_as(
+            &self,
+            _worker: &WorkerUser,
+            command: PrivilegedCommand,
+        ) -> Result<CommandOutput, PrivilegedExecError> {
+            self.calls.lock().expect("lock").push(command);
+            Ok(CommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    /// Appends one entry to `builder` with a well-formed header — mirrors
+    /// `domain::tar_validation`'s own test helper of the same shape.
+    fn append_tar_entry(
+        builder: &mut tar::Builder<Vec<u8>>,
+        path: &str,
+        entry_type: tar::EntryType,
+        content: &[u8],
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).expect("set path");
+        header.set_entry_type(entry_type);
+        header.set_size(content.len() as u64);
+        header.set_mode(if entry_type == tar::EntryType::Directory {
+            0o755
+        } else {
+            0o644
+        });
+        header.set_cksum();
+        builder.append(&header, content).expect("append entry");
+    }
+
+    /// Builds a minimal, well-formed in-memory tar containing a `functions/index.ts` entry (and
+    /// its parent directory entry, required since extraction doesn't auto-create missing
+    /// parents) — enough for [`tar_validation::validate_and_extract`] to accept it.
+    fn sample_tar_bytes() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        append_tar_entry(&mut builder, "functions", tar::EntryType::Directory, b"");
+        append_tar_entry(
+            &mut builder,
+            "functions/index.ts",
+            tar::EntryType::Regular,
+            b"export default {}",
+        );
+        builder.into_inner().expect("finish tar")
+    }
+
     struct NoopExecutor;
 
     #[async_trait]
@@ -327,6 +586,11 @@ mod tests {
             backends: HashMap::from([(ServiceKind::Postgres, backend)]),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
         });
         (deps, repository)
     }
@@ -343,7 +607,198 @@ mod tests {
             backends: HashMap::from([(ServiceKind::Postgres, backend)]),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
         })
+    }
+
+    #[tokio::test]
+    async fn do_spawn_prepares_only_the_slot_dir_when_backend_declares_no_subdirs() {
+        let backend = Arc::new(ScriptedBackend {
+            succeed: true,
+            block_forever: false,
+        });
+        let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
+        let repository = Arc::new(InMemoryClusterRepository::new());
+        let executor = Arc::new(RecordingExecutor::default());
+        let deps = Arc::new(TaskDeps {
+            repository: repository.clone(),
+            client_workers: client_workers(Some(worker.clone())),
+            privileged_exec: executor.clone(),
+            backends: HashMap::from([(ServiceKind::Postgres, backend as Arc<dyn ClusterBackend>)]),
+            clock: Arc::new(FakeClock::new(Utc::now())),
+            worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
+        });
+        let mut cluster = spawning_cluster();
+        repository
+            .try_insert_if_under_quota(&cluster, 10)
+            .await
+            .expect("seed row");
+
+        do_spawn(&deps, &mut cluster, None)
+            .await
+            .expect("spawn succeeds");
+
+        let calls = executor.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            PrivilegedCommand::PrepareWorkerDir {
+                path: "/var/lib/app_salmon/workers/salmon-worker-00/slot-0".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn do_spawn_prepares_each_declared_worker_subdir() {
+        let backend = Arc::new(SubdirDeclaringBackend {
+            subdirs: &["project"],
+        });
+        let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
+        let repository = Arc::new(InMemoryClusterRepository::new());
+        let executor = Arc::new(RecordingExecutor::default());
+        let deps = Arc::new(TaskDeps {
+            repository: repository.clone(),
+            client_workers: client_workers(Some(worker.clone())),
+            privileged_exec: executor.clone(),
+            backends: HashMap::from([(ServiceKind::Postgres, backend as Arc<dyn ClusterBackend>)]),
+            clock: Arc::new(FakeClock::new(Utc::now())),
+            worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
+        });
+        let mut cluster = spawning_cluster();
+        repository
+            .try_insert_if_under_quota(&cluster, 10)
+            .await
+            .expect("seed row");
+
+        do_spawn(&deps, &mut cluster, None)
+            .await
+            .expect("spawn succeeds");
+
+        let calls = executor.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            PrivilegedCommand::PrepareWorkerDir {
+                path: "/var/lib/app_salmon/workers/salmon-worker-00/slot-0/project".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn do_spawn_adopts_a_valid_project_tar_before_calling_backend_spawn() {
+        let backend = Arc::new(SubdirDeclaringBackend {
+            subdirs: &["project"],
+        });
+        let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
+        let repository = Arc::new(InMemoryClusterRepository::new());
+        let executor = Arc::new(RecordingExecutor::default());
+        let staging_root = tempfile::tempdir().expect("tempdir");
+        let deps = Arc::new(TaskDeps {
+            repository: repository.clone(),
+            client_workers: client_workers(Some(worker.clone())),
+            privileged_exec: executor.clone(),
+            backends: HashMap::from([(ServiceKind::Postgres, backend as Arc<dyn ClusterBackend>)]),
+            clock: Arc::new(FakeClock::new(Utc::now())),
+            worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: staging_root.path().to_path_buf(),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
+        });
+        let mut cluster = spawning_cluster();
+        repository
+            .try_insert_if_under_quota(&cluster, 10)
+            .await
+            .expect("seed row");
+        let cluster_id = cluster.id;
+
+        do_spawn(&deps, &mut cluster, Some(&sample_tar_bytes()))
+            .await
+            .expect("spawn succeeds");
+
+        let calls = executor.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "expected a PrepareWorkerDir then an AdoptStagedTree"
+        );
+        let expected_staging = staging_root.path().join(cluster_id.to_string());
+        assert_eq!(
+            calls[1],
+            PrivilegedCommand::AdoptStagedTree {
+                staging_path: expected_staging.display().to_string(),
+                dest_path: "/var/lib/app_salmon/workers/salmon-worker-00/slot-0/project"
+                    .to_string(),
+            }
+        );
+        assert!(
+            !expected_staging.exists(),
+            "staging directory should be cleaned up after a successful adopt"
+        );
+    }
+
+    #[tokio::test]
+    async fn do_spawn_rejects_an_invalid_project_tar_without_calling_backend_spawn() {
+        let backend = Arc::new(SubdirDeclaringBackend {
+            subdirs: &["project"],
+        });
+        let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
+        let repository = Arc::new(InMemoryClusterRepository::new());
+        let executor = Arc::new(RecordingExecutor::default());
+        let staging_root = tempfile::tempdir().expect("tempdir");
+        let deps = Arc::new(TaskDeps {
+            repository: repository.clone(),
+            client_workers: client_workers(Some(worker.clone())),
+            privileged_exec: executor.clone(),
+            backends: HashMap::from([(ServiceKind::Postgres, backend as Arc<dyn ClusterBackend>)]),
+            clock: Arc::new(FakeClock::new(Utc::now())),
+            worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: staging_root.path().to_path_buf(),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
+        });
+        let mut cluster = spawning_cluster();
+        repository
+            .try_insert_if_under_quota(&cluster, 10)
+            .await
+            .expect("seed row");
+        let cluster_id = cluster.id;
+
+        let err = do_spawn(&deps, &mut cluster, Some(b"this is not a tar file"))
+            .await
+            .expect_err("malformed tar is rejected");
+
+        assert!(matches!(err, ClusterError::BackendSpawnFailed(_)));
+        // Only the PrepareWorkerDir call happened — extraction failed before AdoptStagedTree
+        // (and so before `backend.spawn()`, which `SubdirDeclaringBackend` would otherwise
+        // always succeed at) was ever reached.
+        let calls = executor.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(
+            calls[0],
+            PrivilegedCommand::PrepareWorkerDir { .. }
+        ));
+        assert!(
+            !staging_root.path().join(cluster_id.to_string()).exists(),
+            "staging directory should be cleaned up even after a failed extraction"
+        );
     }
 
     #[tokio::test]
@@ -361,7 +816,7 @@ mod tests {
             .await
             .expect("seed row");
 
-        run(deps, cluster.clone(), CancellationToken::new()).await;
+        run(deps, cluster.clone(), CancellationToken::new(), None).await;
 
         let stored = repository
             .get_any(&cluster.id)
@@ -387,7 +842,7 @@ mod tests {
             .await
             .expect("seed row");
 
-        run(deps, cluster.clone(), CancellationToken::new()).await;
+        run(deps, cluster.clone(), CancellationToken::new(), None).await;
 
         let stored = repository
             .get_any(&cluster.id)
@@ -419,7 +874,7 @@ mod tests {
             .await
             .expect("seed row");
 
-        run(deps, cluster.clone(), CancellationToken::new()).await;
+        run(deps, cluster.clone(), CancellationToken::new(), None).await;
 
         let stored = repository
             .get_any(&cluster.id)
@@ -451,7 +906,7 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
-        let handle = tokio::spawn(run(deps.clone(), cluster.clone(), cancel_clone));
+        let handle = tokio::spawn(run(deps.clone(), cluster.clone(), cancel_clone, None));
 
         // Give the task a moment to reach (and block inside) the backend's spawn() call, past
         // worker acquisition, before cancelling — this is what exercises "tear down whatever was
@@ -500,7 +955,13 @@ mod tests {
             .await
             .expect("simulate a concurrent DELETE landing first");
 
-        run(deps.clone(), cluster.clone(), CancellationToken::new()).await;
+        run(
+            deps.clone(),
+            cluster.clone(),
+            CancellationToken::new(),
+            None,
+        )
+        .await;
 
         assert!(
             repository
@@ -523,6 +984,11 @@ mod tests {
             backends: HashMap::new(),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
         });
 
         let cluster = spawning_cluster();
@@ -531,7 +997,7 @@ mod tests {
             .await
             .expect("seed row");
 
-        run(deps, cluster.clone(), CancellationToken::new()).await;
+        run(deps, cluster.clone(), CancellationToken::new(), None).await;
 
         let stored = repository
             .get_any(&cluster.id)
@@ -630,7 +1096,13 @@ mod tests {
             .await
             .expect("simulate the row vanishing before do_spawn resolves");
 
-        run(deps.clone(), cluster.clone(), CancellationToken::new()).await;
+        run(
+            deps.clone(),
+            cluster.clone(),
+            CancellationToken::new(),
+            None,
+        )
+        .await;
 
         assert!(
             repository
@@ -668,7 +1140,7 @@ mod tests {
 
         let deps = deps_with_repo(backend, Some(worker), Arc::new(repository));
 
-        run(deps, cluster, CancellationToken::new()).await;
+        run(deps, cluster, CancellationToken::new(), None).await;
     }
 
     #[tokio::test]
@@ -696,7 +1168,7 @@ mod tests {
         let deps = deps_with_repo(backend, Some(worker), Arc::new(repository));
 
         // Must not panic even though the final persist fails.
-        run(deps, cluster, CancellationToken::new()).await;
+        run(deps, cluster, CancellationToken::new(), None).await;
     }
 
     #[tokio::test]
@@ -723,7 +1195,7 @@ mod tests {
 
         let deps = deps_with_repo(backend, Some(worker), Arc::new(repository));
 
-        run(deps, cluster, CancellationToken::new()).await;
+        run(deps, cluster, CancellationToken::new(), None).await;
     }
 
     #[tokio::test]
@@ -763,7 +1235,7 @@ mod tests {
             .await
             .expect("simulate the row already being Ready by the time we re-check");
 
-        run(deps, cluster.clone(), CancellationToken::new()).await;
+        run(deps, cluster.clone(), CancellationToken::new(), None).await;
 
         let stored = repository
             .get_any(&cluster.id)
@@ -818,7 +1290,7 @@ mod tests {
             .await
             .expect("simulate the row already being Ready by the time we re-check");
 
-        run(deps, cluster.clone(), CancellationToken::new()).await;
+        run(deps, cluster.clone(), CancellationToken::new(), None).await;
 
         let stored = repository
             .get_any(&cluster.id)

@@ -871,10 +871,59 @@ which *does* know the destination) exists — exactly the kind of unexercised, s
 this project avoids. So: byte cap at the edge now (M3); structural tar validation happens exactly
 once, in M4, at the point that actually has a destination to extract into.
 
+### M4a — privileged worker-owned tar adoption: done
+
+Before writing `SupabaseBackend` itself, a real design gap surfaced: `tar_validation::validate_and_extract`
+(M3) runs as the `app_salmon` process, but its destination — the cluster's worker/slot directory —
+is created via `PrepareWorkerDir` and is worker-owned, not `app_salmon`-owned. Extracting directly
+into it would fail with `EACCES` the moment a real worker account is involved; M3/M4's fake-backed
+tests wouldn't have caught this at all, since they run as a single uid. Caught by reasoning through
+the ownership chain before writing `SupabaseBackend`, not by hitting it in M6 — matching this
+project's established preference for finding this class of bug early rather than at the end.
+
+Also surfaced: Postgres's own data directory and an uploaded project tree cannot share one
+directory (`initdb` refuses a non-empty `PGDATA`), so a backend that wants an uploaded tree needs
+its own worker-owned subdirectory distinct from wherever else it stores state.
+
+**Resolution, implemented kind-agnostically in `service::spawn_task`, not as Supabase-specific
+logic:**
+
+- `ClusterBackend` gained `worker_subdirs()` — which worker-owned subdirectories, relative to the
+  slot directory, this backend needs prepared before `spawn()` is called. Defaults to empty
+  (`PostgresBackend` needs no override: it bind-mounts the slot directory directly, unchanged).
+  `do_spawn` issues one privileged `mkdir` (`PrepareWorkerDir`) per declared entry instead of
+  always issuing exactly one for the bare slot directory — the *number* of privileged calls is
+  now data-driven per backend, without `do_spawn` ever branching on `ServiceKind`.
+- A new `PrivilegedCommand::AdoptStagedTree { staging_path, dest_path }`, mapped to `cp -r
+  <staging_path>/. <dest_path>` (via `sudo -u <worker>`, same `SudoExecutor` argv-based mechanism
+  as every other privileged command — never a shell). Deliberately a *copy*, not a rename/move:
+  `staging_path` is `app_salmon`-owned; running the copy as the worker means every byte written to
+  `dest_path` is a fresh write under the worker's own uid, which is what makes the result
+  worker-owned with no separate `chown` step, and sidesteps `mv`'s cross-filesystem `EXDEV` failure
+  mode (and its preserving the *original* uid, which `cp` doesn't).
+- `do_spawn` now: resolves the worker → prepares every declared worker-owned subdirectory → if a
+  `project_tar` was uploaded, extracts it (in Rust, via M3's hardened `validate_and_extract`) into
+  a fresh `app_salmon`-owned staging directory, then adopts it into the conventional `project`
+  subdirectory via the privileged copy above, then removes the staging directory (best-effort,
+  logged not fatal on cleanup failure) → *then* calls the backend's `spawn()`. Extraction happens
+  before any container is created, so a malformed upload is rejected without spinning up
+  Postgres/PostgREST/GoTrue/Kong first.
+- The raw tar bytes flow `create_cluster` → `launch_spawn` → `spawn_task::run` → `do_spawn`
+  entirely in-memory, never touching the persisted `Cluster` row or `ServiceSpec` — consistent
+  with this project's existing crash model (a spawn that dies mid-flight already isn't resumed
+  from the original request; it's reconciled/torn down and the caller re-submits).
+
+Fake-tested only (`RecordingExecutor` asserts exactly which privileged commands `do_spawn` issues
+and with what paths; a real, minimal tar built via `tar::Builder` exercises the success path end
+to end including staging-directory cleanup; a malformed-bytes case confirms extraction failure
+short-circuits before any `AdoptStagedTree` call). Real worker-uid ownership correctness — does a
+container actually get to write files a real worker account produced via this path — is an M6
+concern against the real VM, not something a fake single-uid test process can prove.
+
 ### Not yet built
 
-M4 (`SupabaseBackend` — data-driven service list, network lifecycle, concurrent dependency-aware
-health-wait, JWT signing, the point where `tar_validation` actually gets called against a real
-worker/slot directory) onward: wiring `SupabaseBackend` into the backend registry (M5), and real
-e2e verification of the whole stack — including a genuine tar-supplied edge function executing
-under Kata — in the VM (M6).
+M4b (`SupabaseBackend` itself — data-driven service list, network lifecycle, health-wait, JWT
+signing, mounting the now-populated `project` subdirectory's `functions/` tree into the
+Kata-runtime edge-function container) onward: wiring `SupabaseBackend` into the backend registry
+(M5), and real e2e verification of the whole stack — including a genuine tar-supplied edge
+function executing under Kata — in the VM (M6).

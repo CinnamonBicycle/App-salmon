@@ -1,7 +1,7 @@
-//! Port for running the two filesystem operations `app_salmon` needs to perform as a worker
-//! account instead of as itself. `PrivilegedCommand` is a closed enum, not an argv passthrough —
-//! that's what lets the `/etc/sudoers.d` rule (see `docs/DESIGN.md`) name exactly these two
-//! operations instead of granting an arbitrary-command escape hatch.
+//! Port for running the small, closed set of filesystem operations `app_salmon` needs to perform
+//! as a worker account instead of as itself. `PrivilegedCommand` is a closed enum, not an argv
+//! passthrough — that's what lets the `/etc/sudoers.d` rule (see `docs/DESIGN.md`) name exactly
+//! these operations instead of granting an arbitrary-command escape hatch.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -20,6 +20,22 @@ pub enum PrivilegedCommand {
     WipeWorkerDir {
         /// The absolute path of the directory to wipe.
         path: String,
+    },
+    /// Copies `staging_path`'s contents into `dest_path` (which must already exist, e.g. via a
+    /// prior [`PrivilegedCommand::PrepareWorkerDir`]), run as the worker so the copies land
+    /// worker-owned. A copy, not a rename/move: `staging_path` is owned by the `app_salmon`
+    /// process itself (see `domain::tar_validation`, which extracts an uploaded tar there first,
+    /// safely, before this command ever runs) — running the copy as the worker means every byte
+    /// written to `dest_path` is a fresh write under the worker's own uid, which is what makes it
+    /// worker-owned without a separate `chown` step (and sidesteps `mv`'s cross-filesystem
+    /// `EXDEV` failure mode and its preservation of the *original* uid). `staging_path` itself is
+    /// left for the caller to clean up — it's `app_salmon`-owned, so no privilege is needed for
+    /// that part.
+    AdoptStagedTree {
+        /// Absolute path of the `app_salmon`-owned source directory to copy from.
+        staging_path: String,
+        /// Absolute path of the pre-existing, worker-owned destination directory to copy into.
+        dest_path: String,
     },
 }
 

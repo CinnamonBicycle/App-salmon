@@ -23,6 +23,24 @@ pub trait ClusterBackend: Send + Sync {
     /// The single `ServiceKind` this backend instance handles.
     fn kind(&self) -> ServiceKind;
 
+    /// Which worker-owned subdirectories, relative to the cluster's slot directory, this backend
+    /// needs created (and `chown`'d to the worker) before `spawn` is called — `service::spawn_task`
+    /// issues one privileged `mkdir` per declared entry, so every path this backend later
+    /// bind-mounts is already worker-owned by the time it builds its `ContainerSpec`s (Docker
+    /// itself must never be the one to create a bind-mount source directory: it does so as root,
+    /// which the container's worker-uid process then can't write into).
+    ///
+    /// Defaults to empty, meaning this backend only needs the slot directory itself to exist —
+    /// [`postgres::PostgresBackend`]'s case, which bind-mounts the slot directory directly and so
+    /// needs no override.
+    ///
+    /// # Returns
+    ///
+    /// The relative subdirectory names to prepare, if any.
+    fn worker_subdirs(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Creates and starts whatever this backend needs for `cluster_id`, running as `worker`
     /// (both for the container's `--user` and for the on-disk directory it's bind-mounted into),
     /// and returns how to connect to it once ready. Does not allocate or prepare `worker` itself

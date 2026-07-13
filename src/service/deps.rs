@@ -12,6 +12,7 @@ use crate::backends::ClusterBackend;
 use crate::client_workers::ClientWorkers;
 use crate::domain::ids::ClusterId;
 use crate::domain::service_kind::ServiceKind;
+use crate::domain::tar_validation::TarLimits;
 use crate::ports::clock::Clock;
 use crate::ports::privileged_exec::PrivilegedExecutor;
 use crate::ports::repository::ClusterRepository;
@@ -35,6 +36,15 @@ pub struct TaskDeps {
     /// Base directory under which each worker's own data directory lives (joined with the
     /// worker's name to get its actual path).
     pub worker_data_dir_base: PathBuf,
+    /// Base directory under which an uploaded `project_tar` is extracted (as the `app_salmon`
+    /// process itself, safely — see `domain::tar_validation`) before being handed off to
+    /// [`crate::ports::privileged_exec::PrivilegedCommand::AdoptStagedTree`], which copies it into
+    /// the worker-owned destination. One subdirectory per cluster id; `spawn_task` removes it once
+    /// the copy completes (or the attempt fails), so nothing here outlives a single spawn attempt.
+    pub tar_staging_dir_base: PathBuf,
+    /// Size limits applied when validating/extracting an uploaded `project_tar` — see
+    /// `Config`'s `[limits].max_tar_bytes`/`max_tar_entry_bytes`.
+    pub tar_limits: TarLimits,
 }
 
 /// Tracks a `CancellationToken` per cluster with an in-flight `spawn_task`, so `DELETE` on a

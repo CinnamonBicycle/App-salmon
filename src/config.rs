@@ -68,8 +68,15 @@ pub struct LimitsConfig {
     pub failed_cluster_reap_delay_secs: u64,
     /// The largest `POST /clusters` request body accepted on the `multipart/form-data` path (a
     /// Supabase `project_tar` upload), in bytes — see [`crate::http::AppState::max_tar_bytes`].
-    /// Every other route keeps axum's built-in 2MB default.
+    /// Every other route keeps axum's built-in 2MB default. Also used as
+    /// `tar_validation::TarLimits::max_total_bytes`, the cumulative-extracted-size cap applied
+    /// once the tar is actually validated (see `service::spawn_task`) — the same "how big is too
+    /// big" number applies at both the wire-upload boundary and the extracted-contents boundary.
     pub max_tar_bytes: usize,
+    /// The largest single entry (file) a `project_tar` upload may contain, in bytes — checked
+    /// from each entry's header before it's read, bounding decompression-bomb-style abuse. See
+    /// `tar_validation::TarLimits::max_entry_bytes`.
+    pub max_tar_entry_bytes: u64,
 }
 
 /// `[docker]` — how to reach the Docker daemon and what image to run.
@@ -200,6 +207,16 @@ impl Config {
                 "limits.max_tar_bytes must be at least 1".to_string(),
             ));
         }
+        if self.limits.max_tar_entry_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "limits.max_tar_entry_bytes must be at least 1".to_string(),
+            ));
+        }
+        if self.limits.max_tar_entry_bytes > self.limits.max_tar_bytes as u64 {
+            return Err(ConfigError::Invalid(
+                "limits.max_tar_entry_bytes must not exceed limits.max_tar_bytes".to_string(),
+            ));
+        }
         if self.clients.is_empty() {
             return Err(ConfigError::Invalid(
                 "at least one [[clients]] entry is required".to_string(),
@@ -271,6 +288,7 @@ health_check_timeout_secs = 60
 ttl_reaper_interval_secs = 5
 failed_cluster_reap_delay_secs = 5
 max_tar_bytes = 52428800
+max_tar_entry_bytes = 10485760
 
 [docker]
 socket_path = "/var/run/docker.sock"
@@ -334,6 +352,24 @@ unix_user = "openbrain-agent"
     #[test]
     fn rejects_zero_max_tar_bytes() {
         let toml_str = valid_toml().replace("max_tar_bytes = 52428800", "max_tar_bytes = 0");
+        let err = parse(&toml_str).expect_err("invalid");
+        assert!(matches!(err, super::ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn rejects_zero_max_tar_entry_bytes() {
+        let toml_str =
+            valid_toml().replace("max_tar_entry_bytes = 10485760", "max_tar_entry_bytes = 0");
+        let err = parse(&toml_str).expect_err("invalid");
+        assert!(matches!(err, super::ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn rejects_max_tar_entry_bytes_over_max_tar_bytes() {
+        let toml_str = valid_toml().replace(
+            "max_tar_entry_bytes = 10485760",
+            "max_tar_entry_bytes = 999999999999",
+        );
         let err = parse(&toml_str).expect_err("invalid");
         assert!(matches!(err, super::ConfigError::Invalid(_)));
     }

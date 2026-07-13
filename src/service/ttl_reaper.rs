@@ -169,6 +169,11 @@ mod tests {
             backends: HashMap::new(),
             clock: clock.clone(),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
         });
         (cluster_service, deps, clock)
     }

@@ -77,6 +77,17 @@ fn program_and_args(command: &PrivilegedCommand) -> (&'static str, Vec<String>) 
                 "-delete".to_string(),
             ],
         ),
+        PrivilegedCommand::AdoptStagedTree {
+            staging_path,
+            dest_path,
+        } => (
+            "cp",
+            vec![
+                "-r".to_string(),
+                format!("{staging_path}/."),
+                dest_path.clone(),
+            ],
+        ),
     }
 }
 
@@ -227,6 +238,47 @@ mod tests {
         assert!(target.is_dir());
         let mut entries = tokio::fs::read_dir(&target).await.expect("read dir");
         assert!(entries.next_entry().await.expect("read entry").is_none());
+    }
+
+    #[tokio::test]
+    async fn adopt_staged_tree_copies_contents_into_the_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sudo = write_fake_sudo(dir.path(), "#!/bin/sh\nshift 3\nexec \"$@\"\n").await;
+        let executor =
+            SudoExecutor::new(sudo.to_string_lossy().to_string(), Duration::from_secs(5));
+
+        let staging = dir.path().join("staging");
+        tokio::fs::create_dir_all(staging.join("functions"))
+            .await
+            .expect("create staging tree");
+        tokio::fs::write(
+            staging.join("functions").join("index.ts"),
+            b"export default {}",
+        )
+        .await
+        .expect("write staged file");
+        let dest = dir.path().join("dest");
+        tokio::fs::create_dir_all(&dest).await.expect("create dest");
+
+        executor
+            .run_as(
+                &worker(),
+                PrivilegedCommand::AdoptStagedTree {
+                    staging_path: staging.to_string_lossy().to_string(),
+                    dest_path: dest.to_string_lossy().to_string(),
+                },
+            )
+            .await
+            .expect("adopt succeeds");
+
+        let copied = dest.join("functions").join("index.ts");
+        assert_eq!(
+            tokio::fs::read(&copied).await.expect("read copied file"),
+            b"export default {}"
+        );
+        // The staging tree itself is left in place — cleanup is the caller's job, not this
+        // command's (see the `AdoptStagedTree` doc comment).
+        assert!(staging.join("functions").join("index.ts").exists());
     }
 
     #[tokio::test]

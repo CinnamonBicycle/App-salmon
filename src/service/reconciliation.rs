@@ -174,6 +174,11 @@ mod tests {
             )]),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
         });
         (deps, repository)
     }
@@ -411,6 +416,11 @@ mod tests {
             backends: HashMap::new(),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
         };
 
         // Must not panic even though list_all fails.
@@ -443,6 +453,11 @@ mod tests {
             backends: HashMap::new(),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
         };
 
         // Doesn't panic; the row is left as-is (still Spawning) since the update failed.
@@ -494,6 +509,11 @@ mod tests {
             )]),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
         };
 
         run(&deps).await;
@@ -570,6 +590,11 @@ mod tests {
             )]),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
         };
 
         run(&deps).await;
@@ -611,6 +636,11 @@ mod tests {
             backends: HashMap::new(),
             clock: Arc::new(FakeClock::new(Utc::now())),
             worker_data_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/workers"),
+            tar_staging_dir_base: std::path::PathBuf::from("/var/lib/app_salmon/tar-staging"),
+            tar_limits: crate::domain::tar_validation::TarLimits {
+                max_entry_bytes: 10_485_760,
+                max_total_bytes: 52_428_800,
+            },
         };
 
         run(&deps).await;

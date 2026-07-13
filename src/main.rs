@@ -162,12 +162,13 @@ async fn build_task_deps(
         "kata",
     )?);
     let privileged_exec = Arc::new(SudoExecutor::new("sudo", Duration::from_secs(30)));
-    let worker_data_dir_base = config
+    let storage_dir_base = config
         .storage
         .sqlite_path
         .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("workers");
+        .unwrap_or_else(|| Path::new("."));
+    let worker_data_dir_base = storage_dir_base.join("workers");
+    let tar_staging_dir_base = storage_dir_base.join("tar-staging");
 
     let postgres_backend = Arc::new(PostgresBackend::new(
         container_runtime,
@@ -186,6 +187,11 @@ async fn build_task_deps(
         backends,
         clock: clock.clone(),
         worker_data_dir_base,
+        tar_staging_dir_base,
+        tar_limits: app_salmon::domain::tar_validation::TarLimits {
+            max_entry_bytes: config.limits.max_tar_entry_bytes,
+            max_total_bytes: config.limits.max_tar_bytes as u64,
+        },
     });
 
     reconciliation::run(&task_deps).await;
