@@ -4,7 +4,9 @@
 //! `ClusterService::create` looks the backend up by kind and rejects the request (400) if none
 //! is registered for it.
 
+pub mod health_wait;
 pub mod postgres;
+pub mod supabase;
 
 use async_trait::async_trait;
 

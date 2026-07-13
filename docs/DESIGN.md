@@ -920,10 +920,50 @@ short-circuits before any `AdoptStagedTree` call). Real worker-uid ownership cor
 container actually get to write files a real worker account produced via this path — is an M6
 concern against the real VM, not something a fake single-uid test process can prove.
 
+### M4b — `SupabaseBackend`: done, fake-tested only
+
+New `src/backends/supabase.rs`. Structural design, settled and unit-tested:
+
+- Five containers (`db`, `rest`/`PostgREST`, `auth`/`GoTrue`, `kong`, `functions`), created in a
+  fixed sequence with a shared network (`app-salmon-net-<cluster_id>`) so they reach each other by
+  alias (`db`, `rest`, `auth`, `functions`). Adding a future service (Storage, Realtime,
+  `postgres-meta`) means adding one more container to that sequence, not restructuring it — the
+  extensibility goal from this section's original scope decision.
+- A shared `backends::health_wait::wait_until_healthy` helper, factored out of
+  `PostgresBackend`'s original `wait_until_ready` (which now delegates to it, behavior-preserving —
+  every existing Postgres test still passes unchanged). Widened slightly from the original to also
+  accept `HealthState::None` (Docker's own confirmation that a container has no `HEALTHCHECK`
+  configured at all) as "ready," not just `HealthState::Healthy` — needed since `rest`/`auth`/
+  `functions` don't get an explicit `HealthCheck` on their `ContainerSpec` (see placeholders below).
+- **Deliberate simplifier, decided explicitly**: none of the five containers bind-mount durable,
+  worker-owned storage for their own state — including `db`. These are ephemeral, TTL'd clusters;
+  losing in-container state on a Docker daemon restart is an accepted tradeoff, and it means only
+  one worker-owned subdirectory (`project`, the caller's uploaded tree) is needed, not two,
+  avoiding the `PGDATA`-must-be-empty collision a shared `db`+`project` directory would otherwise
+  hit. `ClusterBackend::worker_subdirs()` returns `&["project"]` for this backend, `&[]` (default)
+  for `PostgresBackend` — unchanged.
+- **Kong configuration**: DB-less mode (`KONG_DATABASE=off`, `KONG_DECLARATIVE_CONFIG`), confirmed
+  against Kong's own current docs (not assumed) rather than the Admin API — `SupabaseBackend`
+  writes a generated `_format_version: "3.0"` YAML file itself (plain, unprivileged
+  `tokio::fs::write`; it's `app_salmon`'s own generated config, not the caller's data, so it needs
+  no worker-ownership dance) and bind-mounts it read-only into Kong. Routes `/rest/v1`, `/auth/v1`,
+  `/functions/v1` to their respective containers by network alias.
+- JWT signing via the `jsonwebtoken` crate (HS256), reusing `SecretGenerator::db_password` for the
+  signing secret rather than adding a dedicated method — a random alphanumeric string is equally
+  suitable for either purpose.
+- Sequential spawn order, not the originally-sketched concurrent dependency-tiered fan-out —
+  simpler to get right and test; revisit only if real spawn latency demands it.
+
+**Explicit placeholders, not yet verified against real images (M6's job, not M4b's)**: `PostgREST`/
+`GoTrue`/edge-runtime container ports, their exact environment variable names, and the edge-runtime
+image's own mount-path convention for `functions/`. Written as reasonable, documented guesses —
+the same starting point Kata's guest-provisioning steps had before M0 corrected them against a real
+VM. Nothing in M4b's own test suite depends on these being exactly right; M6 is where they get
+fixed against reality.
+
 ### Not yet built
 
-M4b (`SupabaseBackend` itself — data-driven service list, network lifecycle, health-wait, JWT
-signing, mounting the now-populated `project` subdirectory's `functions/` tree into the
-Kata-runtime edge-function container) onward: wiring `SupabaseBackend` into the backend registry
-(M5), and real e2e verification of the whole stack — including a genuine tar-supplied edge
-function executing under Kata — in the VM (M6).
+M5 (wiring `SupabaseBackend` into the backend registry alongside `PostgresBackend`, plus the
+`[supabase]` config table `main.rs` needs to construct it) and M6 (real e2e verification of the
+whole stack — including a genuine tar-supplied edge function executing under Kata — in the VM,
+where the M4b placeholders above get corrected against reality).

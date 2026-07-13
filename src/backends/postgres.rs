@@ -21,9 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::time::Instant;
 
-use crate::backends::ClusterBackend;
+use crate::backends::{ClusterBackend, health_wait};
 use crate::client_workers::worker_data_dir;
 use crate::domain::cluster::ClusterError;
 use crate::domain::ids::{ClusterId, WorkerUser};
@@ -31,8 +30,8 @@ use crate::domain::service_kind::{
     ConnectionInfo, PostgresConnectionInfo, ServiceKind, ServiceSpec,
 };
 use crate::ports::container_runtime::{
-    BindMount, ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, DockerError,
-    HealthCheck, HealthState, OciRuntime,
+    BindMount, ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, HealthCheck,
+    OciRuntime,
 };
 use crate::ports::secrets::SecretGenerator;
 use crate::redacted::Redacted;
@@ -41,7 +40,6 @@ const CONTAINER_PORT: u16 = 5432;
 const DB_USER: &str = "app_salmon";
 const DB_NAME: &str = "app_salmon";
 const PASSWORD_LEN: usize = 32;
-const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CLUSTER_ID_LABEL: &str = "app_salmon.cluster_id";
 /// How often Docker itself runs `pg_isready` inside the container — independent of
 /// `HEALTH_POLL_INTERVAL`, which is how often *this backend* asks Docker for the current status.
@@ -109,14 +107,9 @@ impl PostgresBackend {
         }
     }
 
-    /// Polls `inspect` until the container reports a published port and Docker's own
-    /// `HEALTHCHECK` (`pg_isready`, set on the [`ContainerSpec`] this backend submits) reports
-    /// `healthy`, or fails fast if the container exits/vanishes, or times out. Any other status —
-    /// no published port yet, `starting`, `unhealthy`, or no health status reported yet — just
-    /// means "keep polling": Docker itself retries a failing check up to `HEALTHCHECK_RETRIES`
-    /// times before marking a container `unhealthy`, and can recover it back to `healthy` on a
-    /// later check, so this backend's own timeout (not a single failed/unhealthy observation) is
-    /// what ultimately bounds how long a caller waits.
+    /// Polls `inspect` (via the shared [`health_wait::wait_until_healthy`]) until the container
+    /// reports a published port and Docker's own `HEALTHCHECK` (`pg_isready`, set on the
+    /// [`ContainerSpec`] this backend submits) reports healthy.
     ///
     /// # Arguments
     ///
@@ -124,50 +117,25 @@ impl PostgresBackend {
     ///
     /// # Returns
     ///
-    /// The host port Postgres is reachable on, once the container is `Running` with a published
-    /// port and a `healthy` `HEALTHCHECK` status.
+    /// The host port Postgres is reachable on.
     ///
     /// # Errors
     ///
-    /// [`DockerError::ContainerNotHealthy`] (wrapped in a [`ClusterError`]) if the container exits
-    /// or vanishes while waiting; [`DockerError::HealthCheckTimeout`] if `health_check_timeout`
-    /// elapses without the container becoming healthy; or whatever [`ClusterError`] `inspect`
-    /// itself returns on a runtime failure.
+    /// Whatever [`health_wait::wait_until_healthy`] returns, plus
+    /// [`ClusterError::BackendSpawnFailed`] in the (should-never-happen, since this backend
+    /// always requests a published port) case where the container became healthy without one.
     async fn wait_until_ready(&self, handle: &ContainerHandle) -> Result<u16, ClusterError> {
-        let deadline = Instant::now() + self.health_check_timeout;
-        loop {
-            match self.container_runtime.inspect(handle).await? {
-                ContainerStatus::Running {
-                    published_port: Some(port),
-                    health: Some(HealthState::Healthy),
-                } => {
-                    return Ok(port);
-                }
-                ContainerStatus::Running { .. } => {}
-                ContainerStatus::Exited { exit_code } => {
-                    return Err(DockerError::ContainerNotHealthy {
-                        container: handle.clone(),
-                        exit_code: Some(exit_code),
-                    }
-                    .into());
-                }
-                ContainerStatus::NotFound => {
-                    return Err(DockerError::ContainerNotHealthy {
-                        container: handle.clone(),
-                        exit_code: None,
-                    }
-                    .into());
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(DockerError::HealthCheckTimeout {
-                    container: handle.clone(),
-                    waited_secs: self.health_check_timeout.as_secs(),
-                }
-                .into());
-            }
-            tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
-        }
+        health_wait::wait_until_healthy(
+            self.container_runtime.as_ref(),
+            handle,
+            self.health_check_timeout,
+        )
+        .await?
+        .ok_or_else(|| {
+            ClusterError::BackendSpawnFailed(
+                "container reported healthy but published no port".to_string(),
+            )
+        })
     }
 }
 
@@ -505,6 +473,34 @@ mod tests {
         assert!(matches!(
             err,
             crate::domain::cluster::ClusterError::Docker(DockerError::HealthCheckTimeout { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawn_fails_if_healthy_but_no_port_was_ever_published() {
+        // Should never happen in practice (this backend always requests a published port), but
+        // `wait_until_healthy`'s success condition doesn't itself require one — this exercises
+        // `wait_until_ready`'s own defensive `ok_or_else` for that combination.
+        let runtime = FakeContainerRuntime {
+            inspect_status: Mutex::new(Some(ContainerStatus::Running {
+                published_port: None,
+                health: Some(crate::ports::container_runtime::HealthState::Healthy),
+            })),
+            ..Default::default()
+        };
+        let backend = backend(runtime);
+        let worker = WorkerUser::new("salmon-worker-00", 2000, 2000);
+        let service = ServiceSpec {
+            kind: ServiceKind::Postgres,
+            pgvector: false,
+        };
+        let err = backend
+            .spawn(&ClusterId::new(ulid::Ulid::nil()), &worker, 0, &service)
+            .await
+            .expect_err("healthy with no published port is still a failure");
+        assert!(matches!(
+            err,
+            crate::domain::cluster::ClusterError::BackendSpawnFailed(_)
         ));
     }
 
