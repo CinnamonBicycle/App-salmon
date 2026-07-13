@@ -331,31 +331,24 @@ a real host.
   `storage.sqlite_path` directory, a writable `logging.log_dir`, and access to the Docker socket
   (`docker.socket_path`).
 
-## 8a. Known risk: the real Postgres/arbitrary-uid path has never actually run
+## 8a. Formerly-open risk: the real Postgres/arbitrary-uid path — now confirmed, 2026-07-13
 
-Flagging this prominently rather than leaving it as one line among the open questions in §10,
-because it's judged the single most likely thing to break the happy path in a follow-up session:
-`backends::postgres` runs the stock `postgres`/`pgvector` image with `--user <worker-uid>:<worker-gid>`
-against a bind-mounted, worker-owned `PGDATA` directory (see §6). This combination — an arbitrary
-non-root uid with no matching `/etc/passwd` entry *inside* the container, writing to a bind mount
-whose ownership was set by a host-side `chown` — is a historically fragile spot for the official
-Postgres image: its entrypoint script does its own uid/gid and permission probing on startup, and
-versions have differed in how gracefully they handle an unmapped uid. This has been implemented
-faithfully per the design but has **never been exercised against a real Docker daemon** in any
-session so far (this sandboxed environment has neither Docker access nor root — see §9's e2e
-caveat). The first thing a follow-up session with real Docker access should do is simply run
-`just setup-e2e && just test-e2e` and watch `create_cluster::valid_request_eventually_becomes_ready`
-either pass or fail with a concrete container log — before trusting anything else about phase 1.
+**Resolved.** This section originally flagged, as the single most likely thing to break the happy
+path: `backends::postgres` runs the stock `postgres`/`pgvector` image with `--user
+<worker-uid>:<worker-gid>` against a bind-mounted, worker-owned `PGDATA` directory (see §6) — an
+arbitrary non-root uid with no matching `/etc/passwd` entry *inside* the container, writing to a
+bind mount whose ownership was set by a host-side `chown`, historically a fragile spot for the
+official Postgres image. **Confirmed working for real** via `just e2e-vm-up` + `just
+e2e-vm-test` against a real KVM host (§8c): `create_cluster::valid_request_eventually_becomes_ready`
+passed, along with all 17 other e2e tests, in a real guest with real Docker, real `sudo`, and a
+real `pgvector/pgvector:pg16` container. `wait_until_ready`'s dependency on `pg_isready` being on
+`PATH` inside the container (see §9) is confirmed by the same run — the healthcheck-driven
+readiness path worked end to end, not just the container starting.
 
-Unrelated to (and not fixed by) the readiness-mechanism change in §9's testing notes below: that
-change affects *how App Salmon knows Postgres is ready*, not *whether an arbitrary-uid Postgres
-process can start and write to its data directory at all* on a real host. This risk stands as-is.
-
-Also newly relevant here: `wait_until_ready` now depends on the `postgres`/`pgvector` image
-actually having `pg_isready` on `PATH` inside the container for the `CMD-SHELL` healthcheck to
-run (see §9). The official images ship the full `postgresql-client` toolchain including
-`pg_isready`, so this is expected to hold, but — like the arbitrary-uid path above — has not been
-confirmed against a real image pull in this environment.
+This does not, on its own, confirm every environment ever will behave the same (different
+Postgres image versions, different Docker storage drivers, etc. remain theoretically possible
+sources of divergence), but it retires this section's original "this has never been exercised
+against a real Docker daemon in any session" caveat — it now has been, successfully.
 
 **Newly verified this session, unlike the two risks above:** the `sudo-rs` wildcard rejection
 described in §6 *was* confirmed directly, via `visudo -c -f` against a hand-written sudoers
@@ -614,13 +607,17 @@ since that path never listens for inbound connections):**
   explicitly tars up and whatever test output/exit codes come back.
 
 **Verification status:**
-- **Boot-verified for real against a real KVM host (2026-07-13):** VM boot, cloud-init's
-  `write_files`/`ssh_authorized_keys`/host-key injection, and SSH all confirmed working exactly
-  as designed — this was the piece flagged as least certain (untested cloud-init module
-  ordering), and it worked on the first real run. That same run also surfaced the 9p-permission
-  bug described above, found and fixed the same session — not yet re-verified against real KVM
-  since that fix, though the qemu flags and cloud-init schema that *were* verified are otherwise
-  unchanged by it.
+- **Fully boot-verified end to end against a real KVM host, 2026-07-13, across two runs.** Run 1
+  confirmed VM boot, cloud-init's `write_files`/`ssh_authorized_keys`/host-key injection, and SSH
+  — the piece flagged as least certain (untested cloud-init module ordering) — all working exactly
+  as designed, and also surfaced the 9p-permission bug described above (found and fixed the same
+  session). Run 2, after that fix (tear down, rebuild with no 9p share, `vm_sync_repo` instead):
+  `just e2e-vm-up` completed with no issues, and `just e2e-vm-test` — sync, idempotent
+  re-provisioning, then the full e2e suite — passed all 18 tests, including
+  `create_cluster::valid_request_eventually_becomes_ready` (see §8a: this is also the first real
+  confirmation of the arbitrary-uid Postgres path). The mountpoint guard on `vm_sync_repo` was
+  also confirmed for real in this same session, refusing to run against the still-9p-mounted
+  pre-fix VM exactly as designed, before the rebuild.
 - **The SSH security model was independently verified for real in this sandbox, without needing
   KVM** — a real local `sshd` stood in for the guest's sshd (same host key, same
   `AuthorizedKeysFile` pointed at the generated client key, same `PasswordAuthentication no`),
@@ -644,12 +641,11 @@ since that path never listens for inbound connections):**
 - `qemu-img create -F qcow2` and the `-daemonize`/`-pidfile` combination were both exercised for
   real (the latter confirmed to write the correct PID before the launching shell command returns).
 
-What is still **not** verified: `guest-provision.sh` succeeding inside the real cloud image, and
-end-to-end `e2e-vm-up.sh` → `e2e-vm-test` → `e2e-vm-down.sh` against real KVM *since* the
-9p-to-tar fix (boot/cloud-init/SSH were verified before that fix; the fix itself hasn't yet had a
-real KVM run to confirm `vm_sync_repo` and the rest of the pipeline behave against the real guest
-the same way they did against the sandbox stand-in). Next step: re-run the full cycle against a
-scratch checkout and confirm the fix actually resolves the originally-reported `Permission denied`.
+What is still not verified: `e2e-vm-down.sh`'s teardown path itself (graceful SSH poweroff, disk
+wipe) hasn't had an explicit real-KVM confirmation logged, though nothing about it is exotic
+relative to what has been verified. Running the *ephemeral* one-shot path (`test-e2e-vm`, §8b)
+against real KVM remains outstanding, and — per §8b — it has the identical 9p-permission bug,
+unfixed there.
 
 ## 9. Testing & coverage
 
