@@ -31,7 +31,7 @@ use crate::domain::service_kind::{
 };
 use crate::ports::container_runtime::{
     BindMount, ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, HealthCheck,
-    OciRuntime,
+    OciRuntime, PortPublish,
 };
 use crate::ports::secrets::SecretGenerator;
 use crate::redacted::Redacted;
@@ -129,6 +129,7 @@ impl PostgresBackend {
             self.container_runtime.as_ref(),
             handle,
             self.health_check_timeout,
+            true,
         )
         .await?
         .ok_or_else(|| {
@@ -229,7 +230,7 @@ impl ClusterBackend for PostgresBackend {
                 ("POSTGRES_PASSWORD".to_string(), password.clone()),
             ],
             labels,
-            host_port: None,
+            port_publish: PortPublish::Ephemeral,
             container_port: CONTAINER_PORT,
             bind_mount: Some(BindMount {
                 host_path: host_path.display().to_string(),

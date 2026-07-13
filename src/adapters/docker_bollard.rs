@@ -26,7 +26,7 @@ use bollard::query_parameters::{
 
 use crate::ports::container_runtime::{
     ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, DockerError, HealthState,
-    NetworkHandle, OciRuntime,
+    NetworkHandle, OciRuntime, PortPublish,
 };
 
 /// [`ContainerRuntime`] backed by a real Docker Engine API connection.
@@ -111,10 +111,12 @@ fn is_not_found(error: &BollardError) -> bool {
 /// A `ContainerCreateBody` ready to hand to `bollard::Docker::create_container` — environment
 /// variables formatted as `KEY=value` strings, the bind mount (if any) as a `host:container`
 /// string, the healthcheck (if any) translated into Docker's nanosecond-duration `HealthConfig`,
-/// the container's single port exposed and bound to `127.0.0.1`, the OCI runtime
-/// ([`OciRuntime::Runc`] omits `HostConfig.runtime` entirely, letting the daemon's own default
-/// apply — [`OciRuntime::Kata`] sets it to `kata_runtime_name`), and the network attachment (if
-/// any) with its alias.
+/// the container's single port (always `EXPOSE`d as image metadata; only actually bound to
+/// `127.0.0.1` — i.e. `-p` published — when [`PortPublish::Ephemeral`] is requested; see
+/// [`PortPublish`]'s own doc comment for why `Unpublished` is a real, distinct choice and not
+/// just "no specific port requested"), the OCI runtime ([`OciRuntime::Runc`] omits
+/// `HostConfig.runtime` entirely, letting the daemon's own default apply — [`OciRuntime::Kata`]
+/// sets it to `kata_runtime_name`), and the network attachment (if any) with its alias.
 fn container_create_body(spec: &ContainerSpec, kata_runtime_name: &str) -> ContainerCreateBody {
     let env: Vec<String> = spec
         .env
@@ -123,14 +125,20 @@ fn container_create_body(spec: &ContainerSpec, kata_runtime_name: &str) -> Conta
         .collect();
     let container_port_proto = format!("{}/tcp", spec.container_port);
 
-    let mut port_bindings = HashMap::new();
-    port_bindings.insert(
-        container_port_proto.clone(),
-        Some(vec![PortBinding {
-            host_ip: Some("127.0.0.1".to_string()),
-            host_port: spec.host_port.map(|port| port.to_string()),
-        }]),
-    );
+    let port_bindings = match spec.port_publish {
+        PortPublish::Unpublished => None,
+        PortPublish::Ephemeral => {
+            let mut port_bindings = HashMap::new();
+            port_bindings.insert(
+                container_port_proto.clone(),
+                Some(vec![PortBinding {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: None,
+                }]),
+            );
+            Some(port_bindings)
+        }
+    };
 
     let binds = spec.bind_mount.as_ref().map(|bind_mount| {
         vec![format!(
@@ -173,7 +181,7 @@ fn container_create_body(spec: &ContainerSpec, kata_runtime_name: &str) -> Conta
         networking_config,
         host_config: Some(HostConfig {
             binds,
-            port_bindings: Some(port_bindings),
+            port_bindings,
             runtime,
             ..Default::default()
         }),
@@ -724,7 +732,7 @@ mod tests {
     use super::test_support::{FakeDockerEngine, FakeHealth, InspectScenario};
     use crate::ports::container_runtime::{
         BindMount, ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, HealthState,
-        NetworkAttachment, NetworkHandle, OciRuntime,
+        NetworkAttachment, NetworkHandle, OciRuntime, PortPublish,
     };
     use std::collections::HashMap;
 
@@ -734,7 +742,7 @@ mod tests {
             image: "pgvector/pgvector:pg16".to_string(),
             env: vec![("POSTGRES_PASSWORD".to_string(), "secret".to_string())],
             labels: HashMap::from([("app_salmon.cluster_id".to_string(), "01ABC".to_string())]),
-            host_port: None,
+            port_publish: PortPublish::Ephemeral,
             container_port: 5432,
             bind_mount: Some(BindMount {
                 host_path: "/var/lib/app_salmon/workers/salmon-worker-00".to_string(),
@@ -765,6 +773,55 @@ mod tests {
             .await
             .expect("create succeeds");
         assert_eq!(handle, ContainerHandle::new("app-salmon-test-1"));
+    }
+
+    #[tokio::test]
+    async fn create_and_start_sends_port_bindings_for_an_ephemeral_publish() {
+        let engine = FakeDockerEngine::start(InspectScenario::Running {
+            host_port: Some(55432),
+            health: FakeHealth::None,
+        });
+        let runtime = runtime(&engine);
+
+        let mut spec = sample_spec("app-salmon-test-ephemeral-port");
+        spec.port_publish = PortPublish::Ephemeral;
+        runtime
+            .create_and_start(&spec)
+            .await
+            .expect("create succeeds");
+
+        let body = engine
+            .last_create_body()
+            .expect("a create request was sent");
+        let bindings = &body["HostConfig"]["PortBindings"]["5432/tcp"];
+        assert!(
+            bindings.is_array(),
+            "ephemeral publish should send a port binding: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_start_sends_no_port_bindings_when_unpublished() {
+        let engine = FakeDockerEngine::start(InspectScenario::Running {
+            host_port: Some(55432),
+            health: FakeHealth::None,
+        });
+        let runtime = runtime(&engine);
+
+        let mut spec = sample_spec("app-salmon-test-unpublished-port");
+        spec.port_publish = PortPublish::Unpublished;
+        runtime
+            .create_and_start(&spec)
+            .await
+            .expect("create succeeds");
+
+        let body = engine
+            .last_create_body()
+            .expect("a create request was sent");
+        assert!(
+            body["HostConfig"]["PortBindings"].is_null(),
+            "unpublished port should send no port bindings at all: {body}"
+        );
     }
 
     #[tokio::test]

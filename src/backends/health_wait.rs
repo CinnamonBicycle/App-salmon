@@ -18,22 +18,36 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Polls `inspect` until `handle` is ready, or fails fast if it exits/vanishes, or times out.
 ///
-/// "Ready" means [`ContainerStatus::Running`] with either [`HealthState::Healthy`] (the
-/// container's own `HEALTHCHECK` — set via [`crate::ports::container_runtime::ContainerSpec::health_check`]
-/// or baked into its image — passed) or [`HealthState::None`] (Docker's own confirmation that no
-/// `HEALTHCHECK` is configured at all, a stable terminal state for a container that doesn't need
-/// one — as opposed to the *absence* of a `health` field entirely, which some adapters/fakes use
-/// to mean "no information yet" and which this helper keeps polling past). Any other status —
-/// `Starting`, `Unhealthy`, or health information not yet available — just means "keep polling":
-/// Docker itself retries a failing check before marking a container `unhealthy`, and can recover
-/// it to `healthy` on a later check, so this helper's own timeout (not a single bad observation)
-/// is what ultimately bounds how long a caller waits.
+/// What "ready" means depends on `requires_healthcheck`, and deliberately isn't inferred from the
+/// `health` value itself: the real Docker Engine API reports an entirely *absent* `.State.Health`
+/// field (which `adapters::docker_bollard` surfaces as `health: None`, not
+/// `Some(HealthState::None)`) for a container with no `HEALTHCHECK` configured at all — the same
+/// shape a fake/adapter might otherwise use to mean "no information yet." Trying to distinguish
+/// those two cases from the `health` value alone is exactly the ambiguity that produced a real
+/// bug here (a `HealthState::None` variant that real bollard output never actually produces) —
+/// the caller already knows, at the point it built the `ContainerSpec`, whether it asked for a
+/// `HEALTHCHECK`, so it just says so directly instead.
+///
+/// - `requires_healthcheck: true`: ready only once `health` is exactly `Some(HealthState::Healthy)`.
+/// - `requires_healthcheck: false`: ready as soon as the container is `Running` at all, regardless
+///   of what (if anything) `health` reports — there's no `HEALTHCHECK` to wait on, so `Running` is
+///   the best signal available. Callers using this should independently confirm (empirically, not
+///   assumed) that the in-container service is actually accepting requests by the time it reports
+///   `Running`, or add a real `HEALTHCHECK` instead — see `docs/DESIGN.md` §11's M4b placeholders.
+///
+/// Any other status while `requires_healthcheck` is true — `Starting`, `Unhealthy`, or no health
+/// information yet — just means "keep polling": Docker itself retries a failing check before
+/// marking a container `unhealthy`, and can recover it to `healthy` on a later check, so this
+/// helper's own timeout (not a single bad observation) is what ultimately bounds how long a
+/// caller waits.
 ///
 /// # Arguments
 ///
 /// - `container_runtime`: how to inspect `handle`'s current status.
 /// - `handle`: the container to poll.
 /// - `timeout`: the overall deadline to wait before giving up.
+/// - `requires_healthcheck`: whether `handle` was created with a `HEALTHCHECK` to wait on — see
+///   above.
 ///
 /// # Returns
 ///
@@ -51,17 +65,24 @@ pub async fn wait_until_healthy(
     container_runtime: &dyn ContainerRuntime,
     handle: &ContainerHandle,
     timeout: Duration,
+    requires_healthcheck: bool,
 ) -> Result<Option<u16>, ClusterError> {
     let deadline = Instant::now() + timeout;
     loop {
         match container_runtime.inspect(handle).await? {
             ContainerStatus::Running {
                 published_port,
-                health: Some(HealthState::Healthy | HealthState::None),
+                health,
             } => {
-                return Ok(published_port);
+                let ready = if requires_healthcheck {
+                    matches!(health, Some(HealthState::Healthy))
+                } else {
+                    true
+                };
+                if ready {
+                    return Ok(published_port);
+                }
             }
-            ContainerStatus::Running { .. } => {}
             ContainerStatus::Exited { exit_code } => {
                 return Err(DockerError::ContainerNotHealthy {
                     container: handle.clone(),
@@ -154,6 +175,7 @@ mod tests {
             &runtime,
             &ContainerHandle::new("c"),
             Duration::from_millis(50),
+            true,
         )
         .await
         .expect("healthy");
@@ -161,29 +183,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn succeeds_with_no_port_when_the_container_has_no_healthcheck_configured() {
-        // `HealthState::None` (Docker's own confirmation that no HEALTHCHECK is configured) is a
-        // stable terminal state distinct from an entirely absent `health` field — see the
-        // function's own doc comment for why this is the "no healthcheck, Running is enough" case
-        // a service like PostgREST (no HEALTHCHECK set on its ContainerSpec) relies on.
+    async fn succeeds_as_soon_as_running_when_no_healthcheck_was_requested() {
+        // The real Docker Engine API reports an entirely absent `.State.Health` for a container
+        // with no HEALTHCHECK configured (surfaced here as `health: None`, not
+        // `Some(HealthState::None)`) — this is the case `requires_healthcheck: false` exists for,
+        // and it must not depend on the `health` value at all, only on `Running`.
         let runtime = FakeRuntime {
             status: Mutex::new(Some(ContainerStatus::Running {
                 published_port: None,
-                health: Some(HealthState::None),
+                health: None,
             })),
         };
         let port = wait_until_healthy(
             &runtime,
             &ContainerHandle::new("c"),
             Duration::from_millis(50),
+            false,
         )
         .await
-        .expect("no-healthcheck container is ready once running");
+        .expect("no-healthcheck container is ready as soon as it's running");
         assert_eq!(port, None);
     }
 
     #[tokio::test]
-    async fn times_out_when_health_information_is_never_available() {
+    async fn times_out_when_a_healthcheck_is_required_but_health_information_never_arrives() {
         let runtime = FakeRuntime {
             status: Mutex::new(Some(ContainerStatus::Running {
                 published_port: None,
@@ -194,9 +217,10 @@ mod tests {
             &runtime,
             &ContainerHandle::new("c"),
             Duration::from_millis(50),
+            true,
         )
         .await
-        .expect_err("no health info at all never resolves as ready");
+        .expect_err("no health info at all never resolves as ready when one was required");
         assert!(matches!(
             err,
             crate::domain::cluster::ClusterError::Docker(DockerError::HealthCheckTimeout { .. })
@@ -215,6 +239,7 @@ mod tests {
             &runtime,
             &ContainerHandle::new("c"),
             Duration::from_millis(50),
+            true,
         )
         .await
         .expect_err("stuck unhealthy never resolves as ready");
@@ -233,6 +258,7 @@ mod tests {
             &runtime,
             &ContainerHandle::new("c"),
             Duration::from_millis(50),
+            true,
         )
         .await
         .expect_err("exited container is not healthy");
@@ -254,6 +280,7 @@ mod tests {
             &runtime,
             &ContainerHandle::new("c"),
             Duration::from_millis(50),
+            true,
         )
         .await
         .expect_err("vanished container is not healthy");

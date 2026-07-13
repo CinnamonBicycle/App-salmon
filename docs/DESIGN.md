@@ -961,6 +961,44 @@ the same starting point Kata's guest-provisioning steps had before M0 corrected 
 VM. Nothing in M4b's own test suite depends on these being exactly right; M6 is where they get
 fixed against reality.
 
+#### Post-M4b review: three real bugs found and fixed before M5
+
+A design review against the actual `adapters::docker_bollard` mapping code (not just against
+M4b's own fakes, which had quietly encoded the assumptions in question) found three real problems
+— the kind fakes structurally can't catch, since the fake *is* the assumption under test:
+
+1. **Four of the five containers would never have reported ready.** `wait_until_healthy` treated
+   `Some(HealthState::None)` as "no healthcheck configured, ready" — but the real adapter
+   (`container_status_from_response`) produces a bare `None` (the `Option` itself, not
+   `Some(HealthState::None)`) when a container's `.State.Health` is absent entirely, which is
+   exactly what happens for `rest`/`auth`/`kong`/`functions` (none of which set `health_check` on
+   their `ContainerSpec`). `wait_until_healthy` never matched that shape, so those four containers
+   would have polled until `HealthCheckTimeout`, every time. **Fixed** by having
+   `wait_until_healthy` take an explicit `requires_healthcheck: bool` instead of trying to infer
+   intent from the `health` value — the caller already knows, from the `ContainerSpec` it just
+   built, whether it asked for a `HEALTHCHECK`; `SupabaseBackend` passes
+   `spec.health_check.is_some()` per container.
+2. **Every container was host-published, not just Kong.** `ContainerSpec.host_port: Option<u16>`
+   conflated "no specific port requested" with "don't publish" — `container_create_body` inserts a
+   `PortBinding` unconditionally, so `host_port: None` always meant *ephemeral-but-still-published*,
+   never *unpublished*. `rest`/`auth`/`functions` were each getting a `127.0.0.1` port directly
+   reachable from the host, bypassing Kong entirely — for `functions` specifically, a hole punched
+   around the one container where the Kata isolation boundary is supposed to matter most. **Fixed**
+   by replacing `host_port: Option<u16>` with a closed `PortPublish { Unpublished, Ephemeral }` enum
+   (matching this project's established closed-enum-over-ambiguous-`Option`/bool preference — the
+   same reasoning `OciRuntime` was introduced for). Only `db` and `kong` now publish.
+3. **The `functions` bind-mount source could still end up root-owned.** If a caller's tar omitted
+   `functions/` entirely, nothing would have created `<slot>/project/functions` before Docker's own
+   bind-mount machinery did — as root, the exact worker-ownership trap `worker_subdirs` exists to
+   avoid (see M4a above). **Fixed**: `SupabaseBackend::worker_subdirs()` now declares
+   `["project/functions"]` rather than `["project"]`, so `service::spawn_task`'s privileged `mkdir
+   -p` creates it worker-owned unconditionally; `AdoptStagedTree`'s `cp -r` merges the tar's actual
+   contents into it without complaint whether or not `functions/` was present.
+
+All three are fake-tested (a new `PortPublish::Unpublished` case in `docker_bollard`'s own test
+suite; `health_wait`'s widened test coverage) but, like the rest of M4b, not proof the real
+containers behave as intended — that's still M6.
+
 ### Not yet built
 
 M5 (wiring `SupabaseBackend` into the backend registry alongside `PostgresBackend`, plus the

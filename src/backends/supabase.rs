@@ -36,7 +36,7 @@ use crate::domain::service_kind::{
 };
 use crate::ports::container_runtime::{
     ContainerHandle, ContainerRuntime, ContainerSpec, ContainerStatus, HealthCheck,
-    NetworkAttachment, NetworkHandle, OciRuntime,
+    NetworkAttachment, NetworkHandle, OciRuntime, PortPublish,
 };
 use crate::ports::secrets::SecretGenerator;
 use crate::redacted::Redacted;
@@ -285,7 +285,7 @@ impl SupabaseBackend {
                 ("POSTGRES_PASSWORD".to_string(), db_password.to_string()),
             ],
             labels: labels.clone(),
-            host_port: None,
+            port_publish: PortPublish::Ephemeral,
             container_port: DB_PORT,
             bind_mount: None,
             run_as: Some((worker.uid(), worker.gid())),
@@ -315,7 +315,7 @@ impl SupabaseBackend {
                 ("PGRST_JWT_SECRET".to_string(), jwt_secret.to_string()),
             ],
             labels: labels.clone(),
-            host_port: None,
+            port_publish: PortPublish::Unpublished,
             container_port: REST_PORT,
             bind_mount: None,
             run_as: None,
@@ -340,7 +340,7 @@ impl SupabaseBackend {
                 ("GOTRUE_DISABLE_SIGNUP".to_string(), "false".to_string()),
             ],
             labels: labels.clone(),
-            host_port: None,
+            port_publish: PortPublish::Unpublished,
             container_port: AUTH_PORT,
             bind_mount: None,
             run_as: None,
@@ -360,7 +360,7 @@ impl SupabaseBackend {
                 ),
             ],
             labels: labels.clone(),
-            host_port: None,
+            port_publish: PortPublish::Ephemeral,
             container_port: KONG_PORT,
             bind_mount: Some(crate::ports::container_runtime::BindMount {
                 host_path: kong_config_path.to_string(),
@@ -377,7 +377,7 @@ impl SupabaseBackend {
             image: self.edge_runtime_image.clone(),
             env: vec![],
             labels,
-            host_port: None,
+            port_publish: PortPublish::Unpublished,
             container_port: FUNCTIONS_PORT,
             bind_mount: Some(crate::ports::container_runtime::BindMount {
                 host_path: functions_host_path.to_string(),
@@ -404,11 +404,17 @@ impl ClusterBackend for SupabaseBackend {
 
     /// # Returns
     ///
-    /// `&["project"]` — the caller's uploaded project tree (see
-    /// `service::spawn_task::adopt_project_tar`) must be worker-owned before this backend's
-    /// `spawn` builds the `functions` container's bind mount from it.
+    /// `&["project/functions"]`, not just `&["project"]`: `service::spawn_task` runs
+    /// `PrepareWorkerDir` for every declared entry *before* `adopt_project_tar` copies the
+    /// caller's upload in, and `mkdir -p` creates every missing ancestor — so this guarantees
+    /// `<slot>/project/functions` exists, worker-owned, even if the caller's tar never contained a
+    /// `functions/` entry at all (a `functions` bind-mount source Docker had to create itself
+    /// would be root-owned, the same worker-ownership trap `worker_subdirs` exists to avoid in the
+    /// first place — see `docs/DESIGN.md` §11's M4a section). `AdoptStagedTree`'s `cp -r` merges
+    /// into an already-existing directory without complaint, so this is safe whether or not the
+    /// tar actually included `functions/`.
     fn worker_subdirs(&self) -> &[&'static str] {
-        &[PROJECT_SUBDIR]
+        &["project/functions"]
     }
 
     /// Creates the Docker network, then each of the five containers in order (`db` → `rest` →
@@ -489,6 +495,7 @@ impl ClusterBackend for SupabaseBackend {
                 self.container_runtime.as_ref(),
                 &handle,
                 self.health_check_timeout,
+                spec.health_check.is_some(),
             )
             .await?;
             if spec.name == container_name(cluster_id, "kong") {
@@ -728,9 +735,9 @@ mod tests {
     }
 
     #[test]
-    fn worker_subdirs_declares_project() {
+    fn worker_subdirs_declares_project_functions() {
         let backend = backend(FakeContainerRuntime::default(), std::env::temp_dir());
-        assert_eq!(backend.worker_subdirs(), &["project"]);
+        assert_eq!(backend.worker_subdirs(), &["project/functions"]);
     }
 
     #[test]
@@ -1007,9 +1014,13 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_times_out_if_a_container_never_becomes_healthy() {
+        // "db" specifically: it's the only one of the five with a real HEALTHCHECK configured
+        // (see `build_specs`) — the others are waited on via `requires_healthcheck: false`, so
+        // simulating them as `Unhealthy` wouldn't actually block readiness (see
+        // `backends::health_wait`'s own doc comment for why that's by design, not an oversight).
         let runtime = FakeContainerRuntime {
             published_port: 5432,
-            unhealthy_container: Some("auth"),
+            unhealthy_container: Some("db"),
             ..Default::default()
         };
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1019,7 +1030,7 @@ mod tests {
         let err = backend
             .spawn(&cluster_id, &worker(), 0, &service_spec())
             .await
-            .expect_err("auth never becomes healthy");
+            .expect_err("db never becomes healthy");
         assert!(matches!(
             err,
             crate::domain::cluster::ClusterError::Docker(DockerError::HealthCheckTimeout { .. })

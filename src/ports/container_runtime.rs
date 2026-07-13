@@ -191,6 +191,25 @@ pub struct NetworkAttachment {
     pub alias: String,
 }
 
+/// Whether (and how) a container's `container_port` is reachable from the host, as opposed to
+/// only via its network attachment (see [`NetworkAttachment`]) — a closed enum, not a bare
+/// `Option<u16>`, so "not reachable from the host at all" is a distinct, explicit choice rather
+/// than something that has to be inferred. An earlier `Option<u16>`-shaped field conflated "no
+/// specific port requested" with "don't publish" — every container ended up published on *some*
+/// ephemeral host port regardless, which is wrong for a container that's only meant to be
+/// reachable by other containers on the same network (see `docs/DESIGN.md` §11's M4b writeup, and
+/// especially for `SupabaseBackend`'s Kata-isolated `functions` container, where an unintended
+/// host-reachable port would have punched a hole around the one boundary that matters most).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortPublish {
+    /// Not reachable from the host at all — only via the container's network attachment, by
+    /// other containers on the same network.
+    Unpublished,
+    /// Published to the host (on `127.0.0.1`) on an ephemeral, daemon-assigned port — discovered
+    /// afterward via [`ContainerStatus::Running::published_port`].
+    Ephemeral,
+}
+
 /// Declarative description of the container to create. Intentionally has no notion of "how to
 /// get here" (no builder mutation) — a `ContainerSpec` is a value, constructed once by a backend
 /// (e.g. `backends::postgres`) and handed to the runtime.
@@ -212,8 +231,9 @@ pub struct ContainerSpec {
     /// Labels to attach to the container, used to tag it with identifying metadata (e.g. the
     /// owning cluster id) without needing a separate lookup table.
     pub labels: HashMap<String, String>,
-    /// Host port to publish `container_port` on. `None` lets the daemon pick an ephemeral port.
-    pub host_port: Option<u16>,
+    /// Whether/how `container_port` is reachable from the host — non-optional and explicit, like
+    /// [`Self::runtime`], so every call site states its choice.
+    pub port_publish: PortPublish,
     /// The port inside the container to publish on the host.
     pub container_port: u16,
     /// The single bind mount to attach, if any.
@@ -255,7 +275,7 @@ impl fmt::Debug for ContainerSpec {
             .field("image", &self.image)
             .field("env_names", &env_names)
             .field("labels", &self.labels)
-            .field("host_port", &self.host_port)
+            .field("port_publish", &self.port_publish)
             .field("container_port", &self.container_port)
             .field("bind_mount", &self.bind_mount)
             .field("run_as", &self.run_as)
@@ -468,6 +488,7 @@ pub trait ContainerRuntime: Send + Sync {
 mod tests {
     use super::{
         BindMount, ContainerHandle, ContainerSpec, NetworkAttachment, NetworkHandle, OciRuntime,
+        PortPublish,
     };
     use std::collections::HashMap;
 
@@ -499,7 +520,7 @@ mod tests {
                 ),
             ],
             labels,
-            host_port: Some(55432),
+            port_publish: PortPublish::Ephemeral,
             container_port: 5432,
             bind_mount: Some(BindMount {
                 host_path: "/var/lib/app_salmon/workers/salmon-worker-00".to_string(),
@@ -534,7 +555,7 @@ mod tests {
         let debug_output = format!("{:?}", sample_spec());
         assert!(debug_output.contains("app-salmon-01ABC"));
         assert!(debug_output.contains("pgvector/pgvector:pg16"));
-        assert!(debug_output.contains("55432"));
+        assert!(debug_output.contains("Ephemeral"));
         assert!(debug_output.contains("5432"));
         assert!(debug_output.contains("salmon-worker-00"));
         assert!(debug_output.contains("2000"));
