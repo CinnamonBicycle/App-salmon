@@ -1080,7 +1080,37 @@ against the real VM, and — because health-waits run sequentially — let it cl
 and stop at the first broken rung, fix that one specific thing against real container logs, and
 re-run, rather than trying to pre-verify every remaining unknown by more reading.
 
-### Not yet built
+### M6 complete: verified end to end on real KVM (2026-07-14)
 
-The real boot itself (see above), and `tests/e2e/create_supabase_cluster.rs`, which doesn't exist
-yet.
+Added `tests/e2e/create_supabase_cluster.rs`: uploads a real project tar (a `functions/main/index.ts`
+edge function plus a `migrations/` directory, to exercise the "whole tree extracts, only
+`functions/` is consumed" scope decision) via the `multipart/form-data` path and asserts the
+cluster reaches `ready`. Registered `SupabaseBackend` in the e2e harness alongside `PostgresBackend`.
+
+Ran the sequential-health-wait ladder against the real VM exactly as planned — it climbed to the
+first broken rung, got fixed, climbed again, twice:
+
+1. **`db` failed immediately** (`ALTER USER supabase_functions_admin` — "role does not exist").
+   Upstream's `roles.sql` sets passwords on five roles, but `supabase_functions_admin` is only
+   created as a side effect of a `pg_net` extension event trigger — something none of this
+   backend's five services ever installs (no Storage, no webhooks, no pooler). **Fixed**: trimmed
+   `ROLES_SQL` to the two roles this backend's own containers actually connect as (`authenticator`,
+   `supabase_auth_admin`), not the full upstream set assembled for a different service list.
+2. **`rest` never reported healthy** (`postgrest --ready` failing: "Admin server is not running").
+   The healthcheck queries `PostgREST`'s admin server, which only starts if `PGRST_ADMIN_SERVER_PORT`
+   is set — omitted from the original env list even though the main API server (a different port)
+   came up and worked fine regardless, which is exactly why this class of gap survives review and
+   only surfaces against a real boot. **Fixed**: added `PGRST_ADMIN_SERVER_PORT`/`_HOST`.
+
+After both fixes, one full run: `db` → `rest` → `auth` → `kong` → `functions` all became healthy,
+`functions` confirmed running under `Runtime: kata` (`docker inspect`), and — the actual target of
+the whole combined §7(a)+§7(c) effort — a genuinely tar-uploaded, real-Kata-isolated edge function
+answered a real HTTP request through Kong with its own literal response body. `rest`/`auth` were
+independently confirmed reachable through Kong too (`/rest/v1/`, `/auth/v1/health`, both `200`).
+Full e2e suite (all 19 tests, plain-Postgres and Supabase together) green in the same run.
+
+Not revisited because nothing forced it: `db-config`'s persisted pgsodium key (clusters are
+ephemeral, so a fresh key per boot is fine), Kong's router flavor (the `paths:`-based declarative
+config worked under the default flavor without needing `KONG_ROUTER_FLAVOR: expressions`), and
+`_supabase.sql`/`realtime.sql`/`webhooks.sql`/`logs.sql`/`pooler.sql` (none of the five services run
+here need them). This is the honest list of "assumed, not exercised" scope, not a hidden gap.

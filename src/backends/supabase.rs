@@ -109,19 +109,27 @@ const FUNCTIONS_CONTAINER_PATH: &str = "/home/deno/functions";
 /// §11's scope decision — one edge-function slot, not a general router).
 const FUNCTIONS_MAIN_SERVICE_PATH: &str = "/home/deno/functions/main";
 
-/// Verbatim from `supabase/supabase`'s `docker/volumes/db/roles.sql` — sets the shared
+/// Trimmed from `supabase/supabase`'s `docker/volumes/db/roles.sql` — sets the shared
 /// `db_password` (read from the container's own `$POSTGRES_PASSWORD`, via `psql`'s `\set ... `
 /// backtick-exec, not templated by us) on the internal roles the base image already creates.
 /// Pinned as a `const` rather than fetched at runtime so a cluster can spawn without network
 /// access beyond pulling images once — re-sync by hand if upstream changes this file.
+///
+/// Upstream's own version also `ALTER USER`s `pgbouncer`, `supabase_functions_admin`, and
+/// `supabase_storage_admin` — dropped here, and not just for parsimony: `supabase_functions_admin`
+/// (verified against a real boot) does *not* reliably exist at this point in `db`'s init. Its
+/// baked-in migrations only create it as a side effect of a `pg_net`-installed event trigger,
+/// which nothing in this backend's minimal service set (no Storage, no webhooks, no pooler) ever
+/// triggers — so `ALTER USER supabase_functions_admin` reliably fails with "role ... does not
+/// exist" here, even though it's presumably fine in upstream's own compose (which does run those
+/// other services). Trimmed to exactly the two roles this backend's own containers actually
+/// connect as ([`POSTGREST_DB_ROLE`], [`GOTRUE_DB_ROLE`]) rather than also setting passwords on
+/// roles nothing here ever authenticates as.
 const ROLES_SQL: &str = r#"-- NOTE: change to your own passwords for production environments
 \set pgpass `echo "$POSTGRES_PASSWORD"`
 
 ALTER USER authenticator WITH PASSWORD :'pgpass';
-ALTER USER pgbouncer WITH PASSWORD :'pgpass';
 ALTER USER supabase_auth_admin WITH PASSWORD :'pgpass';
-ALTER USER supabase_functions_admin WITH PASSWORD :'pgpass';
-ALTER USER supabase_storage_admin WITH PASSWORD :'pgpass';
 "#;
 
 /// Verbatim from `supabase/supabase`'s `docker/volumes/db/jwt.sql` — sets the
@@ -413,6 +421,16 @@ impl SupabaseBackend {
                 ),
                 ("PGRST_DB_ANON_ROLE".to_string(), "anon".to_string()),
                 ("PGRST_JWT_SECRET".to_string(), jwt_secret.to_string()),
+                // `postgrest --ready` (this spec's own healthcheck) queries the admin server, not
+                // the main API port — without this, PostgREST never starts one at all and the
+                // healthcheck fails forever with "Admin server is not running" (found via a real
+                // boot, not upstream's docs — easy to miss since the main API server comes up
+                // and works fine either way).
+                ("PGRST_ADMIN_SERVER_PORT".to_string(), "3001".to_string()),
+                (
+                    "PGRST_ADMIN_SERVER_HOST".to_string(),
+                    "localhost".to_string(),
+                ),
             ],
             labels: labels.clone(),
             port_publish: PortPublish::Unpublished,
