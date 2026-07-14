@@ -1,13 +1,32 @@
-//! A Supabase stack: Postgres+pgvector, `PostgREST`, `GoTrue`, Kong (the single ingress), and a
-//! Kata-sandboxed edge-function runtime — see `docs/DESIGN.md` §11.
+//! A Supabase stack: Postgres (Supabase's own image, with pgvector, roles, and schemas baked in),
+//! `PostgREST`, `GoTrue`, Kong (the single ingress), and a Kata-sandboxed edge-function runtime —
+//! see `docs/DESIGN.md` §11.
 //!
-//! **Placeholder specifics, verified against reality in M6, not before**: exact container ports,
-//! environment variable names, and the edge-function image's own mount-path convention are
-//! reasonable-but-unverified choices, the same way Kata's guest-provisioning steps (§11, M0) were
-//! first written from documentation and then corrected against a real VM. What *is* structurally
-//! settled here — data-driven service list, network lifecycle, sequential health-waits, JWT
-//! signing, and the `project` subdirectory convention `service::spawn_task` populates before this
-//! backend's `spawn` is ever called — is fake-tested and not expected to change in M6.
+//! Container images, port numbers, environment variable names, healthcheck commands, and mount
+//! paths below are transcribed from upstream Supabase's own self-hosting
+//! `docker/docker-compose.yml` (`supabase/supabase` on GitHub, read directly — not assumed from
+//! training data) at the time this was written, restricted to the five services this backend
+//! actually runs (Storage/Realtime/`postgres-meta`/Studio/Supavisor/Logflare are all omitted, see
+//! `docs/DESIGN.md` §11's scope decision). This is **not** the same as having booted these five
+//! containers together ourselves — some interactions (whether every env var named here is
+//! actually sufficient, whether the `db` container needs anything from upstream's `db-config`
+//! named volume to start cleanly) are only knowable by doing that, which is M6's remaining work.
+//!
+//! The `db` container specifically cannot be the same plain `pgvector/pgvector` image
+//! [`crate::backends::postgres::PostgresBackend`] uses: `PostgREST`/`GoTrue` connect as
+//! Supabase-specific roles (`authenticator`, `supabase_auth_admin`) and expect Supabase's own
+//! `auth`/schemas already migrated in. Upstream's own `supabase/postgres` image bakes all of that
+//! in; `roles.sql`/`jwt.sql` (mounted into `/docker-entrypoint-initdb.d/init-scripts/`, verbatim
+//! from upstream — see [`ROLES_SQL`]/[`JWT_SQL`]) only need to set the *dynamic* per-deployment
+//! password and JWT secret on those already-existing roles, via `psql`'s own `` \\set var
+//! `echo "$ENV_VAR"` `` mechanism reading the container's own environment — so these two files
+//! don't need any per-cluster templating on our side, just to be mounted in with the right env
+//! vars set alongside them.
+//!
+//! What's structurally settled here — data-driven service list, network lifecycle, sequential
+//! health-waits, JWT signing, and the `project` subdirectory convention `service::spawn_task`
+//! populates before this backend's `spawn` is ever called — is fake-tested and not expected to
+//! change in M6.
 //!
 //! Unlike [`crate::backends::postgres::PostgresBackend`], none of the five containers here bind-mount
 //! durable, worker-owned storage for their *own* state (Postgres included) — these are ephemeral,
@@ -45,13 +64,26 @@ const DB_PORT: u16 = 5432;
 const REST_PORT: u16 = 3000;
 const AUTH_PORT: u16 = 9999;
 const KONG_PORT: u16 = 8000;
-/// Placeholder — verify against `supabase/edge-runtime`'s actual default in M6.
+/// Matches upstream's `functions` service healthcheck target (`/dev/tcp/127.0.0.1/9000`) in
+/// `docker/docker-compose.yml`.
 const FUNCTIONS_PORT: u16 = 9000;
 
-const DB_USER: &str = "app_salmon";
-const DB_NAME: &str = "app_salmon";
+/// Supabase's Postgres image creates its superuser as `postgres`, not a caller-chosen name — this
+/// backend doesn't set `POSTGRES_USER`, so this is the image's own default, not a name we chose.
+const DB_USER: &str = "postgres";
+const DB_NAME: &str = "postgres";
+/// The role `PostgREST` connects as (`PGRST_DB_URI`) — one of the roles `ROLES_SQL` sets the
+/// shared `db_password` on; baked into the `supabase/postgres` image itself, not created by us.
+const POSTGREST_DB_ROLE: &str = "authenticator";
+/// The role `GoTrue` connects as (`GOTRUE_DB_DATABASE_URL`) — see [`POSTGREST_DB_ROLE`].
+const GOTRUE_DB_ROLE: &str = "supabase_auth_admin";
 const DB_PASSWORD_LEN: usize = 32;
 const JWT_SECRET_LEN: usize = 40;
+/// Value for the `app.settings.jwt_exp`/`GOTRUE_JWT_EXP`/`PGRST_APP_SETTINGS_JWT_EXP` GUCs —
+/// upstream's own `.env.example` default (seconds). Distinct from [`JWT_VALIDITY_SECS`]: this is
+/// how long a token these services *themselves* mint should live, not how long the tokens *this
+/// backend* signs and hands back in [`SupabaseConnectionInfo`] should live.
+const DB_JWT_EXP_SECS: &str = "3600";
 /// How long a signed `anon`/`service_role` JWT stays valid for — deliberately long (not tied to
 /// the cluster's own TTL, which `spawn` doesn't have access to): an expired-but-otherwise-valid
 /// cluster's tokens failing early would be a confusing, silent failure mode a caller has no way
@@ -65,8 +97,43 @@ const CLUSTER_ID_LABEL: &str = "app_salmon.cluster_id";
 /// [`ClusterBackend::worker_subdirs`]'s doc comment for why the two aren't literally the same
 /// constant: `spawn_task` is kind-agnostic and doesn't import backend-specific names).
 const PROJECT_SUBDIR: &str = "project";
-/// Placeholder — verify against `supabase/edge-runtime`'s actual mount-path convention in M6.
-const FUNCTIONS_CONTAINER_PATH: &str = "/functions";
+/// Where the caller's `functions/` subtree is mounted inside the edge-runtime container — matches
+/// upstream's own `./volumes/functions:/home/deno/functions` bind mount.
+const FUNCTIONS_CONTAINER_PATH: &str = "/home/deno/functions";
+/// `edge-runtime`'s `--main-service` flag names a single directory to serve as the fallback
+/// function for any request path Kong routes to `/functions/v1/*` — matching upstream's own
+/// `--main-service /home/deno/functions/main`. This means a caller's uploaded tar must place its
+/// (single, for this pass) edge function at `functions/main/` — e.g. `functions/main/index.ts` —
+/// not an arbitrarily-named subdirectory; per-path routing to multiple named functions is
+/// upstream's own `EDGE_RUNTIME_ROUTER_CONFIG` mechanism, out of scope here (see `docs/DESIGN.md`
+/// §11's scope decision — one edge-function slot, not a general router).
+const FUNCTIONS_MAIN_SERVICE_PATH: &str = "/home/deno/functions/main";
+
+/// Verbatim from `supabase/supabase`'s `docker/volumes/db/roles.sql` — sets the shared
+/// `db_password` (read from the container's own `$POSTGRES_PASSWORD`, via `psql`'s `\set ... `
+/// backtick-exec, not templated by us) on the internal roles the base image already creates.
+/// Pinned as a `const` rather than fetched at runtime so a cluster can spawn without network
+/// access beyond pulling images once — re-sync by hand if upstream changes this file.
+const ROLES_SQL: &str = r#"-- NOTE: change to your own passwords for production environments
+\set pgpass `echo "$POSTGRES_PASSWORD"`
+
+ALTER USER authenticator WITH PASSWORD :'pgpass';
+ALTER USER pgbouncer WITH PASSWORD :'pgpass';
+ALTER USER supabase_auth_admin WITH PASSWORD :'pgpass';
+ALTER USER supabase_functions_admin WITH PASSWORD :'pgpass';
+ALTER USER supabase_storage_admin WITH PASSWORD :'pgpass';
+"#;
+
+/// Verbatim from `supabase/supabase`'s `docker/volumes/db/jwt.sql` — sets the
+/// `app.settings.jwt_secret`/`app.settings.jwt_exp` database-level GUCs some of Supabase's baked-in
+/// Postgres functions read, from the container's own `$JWT_SECRET`/`$JWT_EXP`. See [`ROLES_SQL`]
+/// for why this is pinned verbatim rather than templated.
+const JWT_SQL: &str = r#"\set jwt_secret `echo "$JWT_SECRET"`
+\set jwt_exp `echo "$JWT_EXP"`
+
+ALTER DATABASE postgres SET "app.settings.jwt_secret" TO :'jwt_secret';
+ALTER DATABASE postgres SET "app.settings.jwt_exp" TO :'jwt_exp';
+"#;
 
 /// Claims signed into the `anon`/`service_role` JWTs handed back in [`SupabaseConnectionInfo`].
 /// Mirrors real Supabase's own minimal claim set closely enough for `PostgREST`/`GoTrue` to
@@ -114,7 +181,10 @@ fn sign_jwt(secret: &str, role: &str) -> Result<String, ClusterError> {
 
 /// Kong's DB-less declarative config (`_format_version: "3.0"`), routing App Salmon's minimal
 /// ingress surface (`/rest/v1`, `/auth/v1`, `/functions/v1`) to the other containers by their
-/// network alias — see the module doc comment re: placeholder specifics.
+/// network alias. Uses Kong's traditional (`paths:`-based) route matching, which works under
+/// Kong's default router flavor — deliberately does *not* set `KONG_ROUTER_FLAVOR: expressions`
+/// the way upstream's own compose file does, since that flavor expects routes written in Kong's
+/// newer expression DSL instead of this simpler form.
 ///
 /// # Arguments
 ///
@@ -195,10 +265,11 @@ pub struct SupabaseBackend {
     kong_image: String,
     edge_runtime_image: String,
     worker_data_dir_base: PathBuf,
-    /// Base directory `spawn` writes each cluster's generated `kong.yml` into — `app_salmon`-owned
-    /// (unprivileged: this is `app_salmon`'s own generated config, not the caller's data, so it
-    /// needs no worker-ownership dance), one subdirectory per cluster, removed by `teardown`.
-    kong_config_dir_base: PathBuf,
+    /// Base directory `spawn` writes each cluster's generated `kong.yml`/`roles.sql`/`jwt.sql`
+    /// into — `app_salmon`-owned (unprivileged: this is `app_salmon`'s own generated config, not
+    /// the caller's data, so it needs no worker-ownership dance), one subdirectory per cluster,
+    /// removed by `teardown`.
+    generated_config_dir_base: PathBuf,
     health_check_timeout: Duration,
 }
 
@@ -213,7 +284,7 @@ impl SupabaseBackend {
     ///   `edge_runtime_image`: the image references to run for each container.
     /// - `worker_data_dir_base`: base directory under which each worker's own data directory
     ///   lives — used to recompute the `project` subdirectory `service::spawn_task` populated.
-    /// - `kong_config_dir_base`: base directory to write each cluster's generated `kong.yml` into.
+    /// - `generated_config_dir_base`: base directory to write each cluster's generated `kong.yml` into.
     /// - `health_check_timeout`: the overall deadline each container's health-wait polls against.
     ///
     /// # Returns
@@ -233,7 +304,7 @@ impl SupabaseBackend {
         kong_image: String,
         edge_runtime_image: String,
         worker_data_dir_base: PathBuf,
-        kong_config_dir_base: PathBuf,
+        generated_config_dir_base: PathBuf,
         health_check_timeout: Duration,
     ) -> Self {
         Self {
@@ -245,7 +316,7 @@ impl SupabaseBackend {
             kong_image,
             edge_runtime_image,
             worker_data_dir_base,
-            kong_config_dir_base,
+            generated_config_dir_base,
             health_check_timeout,
         }
     }
@@ -262,7 +333,11 @@ impl SupabaseBackend {
         worker: &WorkerUser,
         db_password: &str,
         jwt_secret: &str,
+        anon_key: &str,
+        service_role_key: &str,
         kong_config_path: &str,
+        roles_sql_path: &str,
+        jwt_sql_path: &str,
         functions_host_path: &str,
     ) -> Vec<ContainerSpec> {
         let net = network_name(cluster_id);
@@ -280,26 +355,48 @@ impl SupabaseBackend {
             name: container_name(cluster_id, "db"),
             image: self.postgres_image.clone(),
             env: vec![
-                ("POSTGRES_USER".to_string(), DB_USER.to_string()),
                 ("POSTGRES_DB".to_string(), DB_NAME.to_string()),
                 ("POSTGRES_PASSWORD".to_string(), db_password.to_string()),
+                ("JWT_SECRET".to_string(), jwt_secret.to_string()),
+                ("JWT_EXP".to_string(), DB_JWT_EXP_SECS.to_string()),
             ],
             labels: labels.clone(),
             port_publish: PortPublish::Ephemeral,
             container_port: DB_PORT,
-            bind_mount: None,
-            run_as: Some((worker.uid(), worker.gid())),
+            bind_mounts: vec![
+                crate::ports::container_runtime::BindMount {
+                    host_path: roles_sql_path.to_string(),
+                    container_path: "/docker-entrypoint-initdb.d/init-scripts/99-roles.sql"
+                        .to_string(),
+                },
+                crate::ports::container_runtime::BindMount {
+                    host_path: jwt_sql_path.to_string(),
+                    container_path: "/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql"
+                        .to_string(),
+                },
+            ],
+            // No worker-owned host storage backs this container's data directory (see the module
+            // doc comment — Supabase clusters don't persist container-internal state across a
+            // restart), so there's no host-ownership reason to run as `worker`, and doing so would
+            // fight the `supabase/postgres` image's own baked-in expectation that its data
+            // directory is owned by whatever internal user its entrypoint runs as.
+            run_as: None,
             health_check: Some(HealthCheck {
                 test: vec![
-                    "CMD-SHELL".to_string(),
-                    format!("pg_isready -U {DB_USER} -d {DB_NAME}"),
+                    "CMD".to_string(),
+                    "pg_isready".to_string(),
+                    "-U".to_string(),
+                    DB_USER.to_string(),
+                    "-h".to_string(),
+                    "localhost".to_string(),
                 ],
                 interval: Duration::from_secs(1),
                 timeout: Duration::from_secs(2),
-                retries: 3,
+                retries: 10,
             }),
             runtime: OciRuntime::Runc,
             network: attach("db"),
+            command: None,
         };
 
         let rest = ContainerSpec {
@@ -308,45 +405,88 @@ impl SupabaseBackend {
             env: vec![
                 (
                     "PGRST_DB_URI".to_string(),
-                    format!("postgres://{DB_USER}:{db_password}@db:{DB_PORT}/{DB_NAME}"),
+                    format!("postgres://{POSTGREST_DB_ROLE}:{db_password}@db:{DB_PORT}/{DB_NAME}"),
                 ),
-                ("PGRST_DB_SCHEMAS".to_string(), "public".to_string()),
+                (
+                    "PGRST_DB_SCHEMAS".to_string(),
+                    "public,graphql_public".to_string(),
+                ),
                 ("PGRST_DB_ANON_ROLE".to_string(), "anon".to_string()),
                 ("PGRST_JWT_SECRET".to_string(), jwt_secret.to_string()),
             ],
             labels: labels.clone(),
             port_publish: PortPublish::Unpublished,
             container_port: REST_PORT,
-            bind_mount: None,
+            bind_mounts: vec![],
             run_as: None,
-            health_check: None,
+            health_check: Some(HealthCheck {
+                test: vec![
+                    "CMD".to_string(),
+                    "postgrest".to_string(),
+                    "--ready".to_string(),
+                ],
+                interval: Duration::from_secs(1),
+                timeout: Duration::from_secs(2),
+                retries: 5,
+            }),
             runtime: OciRuntime::Runc,
             network: attach("rest"),
+            command: None,
         };
 
         let auth = ContainerSpec {
             name: container_name(cluster_id, "auth"),
             image: self.gotrue_image.clone(),
             env: vec![
+                ("GOTRUE_API_HOST".to_string(), "0.0.0.0".to_string()),
+                ("GOTRUE_API_PORT".to_string(), AUTH_PORT.to_string()),
                 (
-                    "DATABASE_URL".to_string(),
-                    format!("postgres://{DB_USER}:{db_password}@db:{DB_PORT}/{DB_NAME}"),
+                    "API_EXTERNAL_URL".to_string(),
+                    "http://kong:8000/auth/v1".to_string(),
                 ),
-                ("GOTRUE_JWT_SECRET".to_string(), jwt_secret.to_string()),
+                ("GOTRUE_DB_DRIVER".to_string(), "postgres".to_string()),
+                (
+                    "GOTRUE_DB_DATABASE_URL".to_string(),
+                    format!("postgres://{GOTRUE_DB_ROLE}:{db_password}@db:{DB_PORT}/{DB_NAME}"),
+                ),
                 (
                     "GOTRUE_SITE_URL".to_string(),
-                    "http://localhost".to_string(),
+                    "http://localhost:3000".to_string(),
                 ),
                 ("GOTRUE_DISABLE_SIGNUP".to_string(), "false".to_string()),
+                (
+                    "GOTRUE_JWT_ADMIN_ROLES".to_string(),
+                    "service_role".to_string(),
+                ),
+                ("GOTRUE_JWT_AUD".to_string(), "authenticated".to_string()),
+                (
+                    "GOTRUE_JWT_DEFAULT_GROUP_NAME".to_string(),
+                    "authenticated".to_string(),
+                ),
+                ("GOTRUE_JWT_EXP".to_string(), DB_JWT_EXP_SECS.to_string()),
+                ("GOTRUE_JWT_SECRET".to_string(), jwt_secret.to_string()),
             ],
             labels: labels.clone(),
             port_publish: PortPublish::Unpublished,
             container_port: AUTH_PORT,
-            bind_mount: None,
+            bind_mounts: vec![],
             run_as: None,
-            health_check: None,
+            health_check: Some(HealthCheck {
+                test: vec![
+                    "CMD".to_string(),
+                    "wget".to_string(),
+                    "--no-verbose".to_string(),
+                    "--tries=1".to_string(),
+                    "--spider".to_string(),
+                    "http://localhost:9999/health".to_string(),
+                ],
+                interval: Duration::from_secs(1),
+                timeout: Duration::from_secs(2),
+                retries: 5,
+            }),
             runtime: OciRuntime::Runc,
             network: attach("auth"),
+            command: None,
         };
 
         let kong = ContainerSpec {
@@ -356,37 +496,69 @@ impl SupabaseBackend {
                 ("KONG_DATABASE".to_string(), "off".to_string()),
                 (
                     "KONG_DECLARATIVE_CONFIG".to_string(),
-                    "/kong/declarative/kong.yml".to_string(),
+                    "/usr/local/kong/kong.yml".to_string(),
+                ),
+                ("SUPABASE_ANON_KEY".to_string(), anon_key.to_string()),
+                (
+                    "SUPABASE_SERVICE_KEY".to_string(),
+                    service_role_key.to_string(),
                 ),
             ],
             labels: labels.clone(),
             port_publish: PortPublish::Ephemeral,
             container_port: KONG_PORT,
-            bind_mount: Some(crate::ports::container_runtime::BindMount {
+            bind_mounts: vec![crate::ports::container_runtime::BindMount {
                 host_path: kong_config_path.to_string(),
-                container_path: "/kong/declarative/kong.yml".to_string(),
-            }),
+                container_path: "/usr/local/kong/kong.yml".to_string(),
+            }],
             run_as: None,
-            health_check: None,
+            health_check: Some(HealthCheck {
+                test: vec!["CMD".to_string(), "kong".to_string(), "health".to_string()],
+                interval: Duration::from_secs(1),
+                timeout: Duration::from_secs(2),
+                retries: 5,
+            }),
             runtime: OciRuntime::Runc,
             network: attach("kong"),
+            command: None,
         };
 
         let functions = ContainerSpec {
             name: container_name(cluster_id, "functions"),
             image: self.edge_runtime_image.clone(),
-            env: vec![],
+            env: vec![
+                ("JWT_SECRET".to_string(), jwt_secret.to_string()),
+                ("SUPABASE_URL".to_string(), "http://kong:8000".to_string()),
+                ("SUPABASE_ANON_KEY".to_string(), anon_key.to_string()),
+                (
+                    "SUPABASE_SERVICE_ROLE_KEY".to_string(),
+                    service_role_key.to_string(),
+                ),
+                (
+                    "SUPABASE_DB_URL".to_string(),
+                    format!("postgresql://{DB_USER}:{db_password}@db:{DB_PORT}/{DB_NAME}"),
+                ),
+                ("VERIFY_JWT".to_string(), "false".to_string()),
+            ],
             labels,
             port_publish: PortPublish::Unpublished,
             container_port: FUNCTIONS_PORT,
-            bind_mount: Some(crate::ports::container_runtime::BindMount {
+            bind_mounts: vec![crate::ports::container_runtime::BindMount {
                 host_path: functions_host_path.to_string(),
                 container_path: FUNCTIONS_CONTAINER_PATH.to_string(),
-            }),
+            }],
+            // Unlike `db`, this container's one bind mount *is* worker-owned host data (the
+            // caller's uploaded functions/ subtree) — running as `worker` sidesteps having to
+            // reason about whatever mode `PrepareWorkerDir`'s `mkdir -p` left it at.
             run_as: Some((worker.uid(), worker.gid())),
             health_check: None,
             runtime: OciRuntime::Kata,
             network: attach("functions"),
+            command: Some(vec![
+                "start".to_string(),
+                "--main-service".to_string(),
+                FUNCTIONS_MAIN_SERVICE_PATH.to_string(),
+            ]),
         };
 
         vec![db, rest, auth, kong, functions]
@@ -452,20 +624,25 @@ impl ClusterBackend for SupabaseBackend {
     ) -> Result<ConnectionInfo, ClusterError> {
         let db_password = self.secrets.db_password(DB_PASSWORD_LEN);
         let jwt_secret = self.secrets.db_password(JWT_SECRET_LEN);
+        // Signed up front, not after the spawn loop: the `functions` container's own env vars
+        // need these (`SUPABASE_ANON_KEY`/`SUPABASE_SERVICE_ROLE_KEY`), and it's created within
+        // this same loop below.
+        let anon_key = sign_jwt(&jwt_secret, "anon")?;
+        let service_role_key = sign_jwt(&jwt_secret, "service_role")?;
 
         self.container_runtime
             .create_network(&network_name(cluster_id))
             .await?;
 
-        let kong_config_dir = self.kong_config_dir_base.join(cluster_id.to_string());
-        tokio::fs::create_dir_all(&kong_config_dir)
+        let generated_config_dir = self.generated_config_dir_base.join(cluster_id.to_string());
+        tokio::fs::create_dir_all(&generated_config_dir)
             .await
             .map_err(|_source| {
                 ClusterError::BackendSpawnFailed(
-                    "failed to prepare kong config directory".to_string(),
+                    "failed to prepare generated config directory".to_string(),
                 )
             })?;
-        let kong_config_path = kong_config_dir.join("kong.yml");
+        let kong_config_path = generated_config_dir.join("kong.yml");
         tokio::fs::write(
             &kong_config_path,
             kong_declarative_config("rest", "auth", "functions"),
@@ -474,6 +651,18 @@ impl ClusterBackend for SupabaseBackend {
         .map_err(|_source| {
             ClusterError::BackendSpawnFailed("failed to write kong declarative config".to_string())
         })?;
+        let roles_sql_path = generated_config_dir.join("roles.sql");
+        tokio::fs::write(&roles_sql_path, ROLES_SQL)
+            .await
+            .map_err(|_source| {
+                ClusterError::BackendSpawnFailed("failed to write roles.sql".to_string())
+            })?;
+        let jwt_sql_path = generated_config_dir.join("jwt.sql");
+        tokio::fs::write(&jwt_sql_path, JWT_SQL)
+            .await
+            .map_err(|_source| {
+                ClusterError::BackendSpawnFailed("failed to write jwt.sql".to_string())
+            })?;
 
         let functions_host_path = worker_data_dir(&self.worker_data_dir_base, worker, slot)
             .join(PROJECT_SUBDIR)
@@ -484,7 +673,11 @@ impl ClusterBackend for SupabaseBackend {
             worker,
             &db_password,
             &jwt_secret,
+            &anon_key,
+            &service_role_key,
             &kong_config_path.display().to_string(),
+            &roles_sql_path.display().to_string(),
+            &jwt_sql_path.display().to_string(),
             &functions_host_path.display().to_string(),
         );
 
@@ -529,8 +722,8 @@ impl ClusterBackend for SupabaseBackend {
                 user: DB_USER.to_string(),
                 password: Redacted::new(db_password),
             },
-            anon_key: Redacted::new(sign_jwt(&jwt_secret, "anon")?),
-            service_role_key: Redacted::new(sign_jwt(&jwt_secret, "service_role")?),
+            anon_key: Redacted::new(anon_key),
+            service_role_key: Redacted::new(service_role_key),
             jwt_secret: Redacted::new(jwt_secret),
         }))
     }
@@ -560,8 +753,8 @@ impl ClusterBackend for SupabaseBackend {
         self.container_runtime
             .remove_network(&NetworkHandle::new(network_name(cluster_id)))
             .await?;
-        let kong_config_dir = self.kong_config_dir_base.join(cluster_id.to_string());
-        if let Err(error) = tokio::fs::remove_dir_all(&kong_config_dir).await
+        let generated_config_dir = self.generated_config_dir_base.join(cluster_id.to_string());
+        if let Err(error) = tokio::fs::remove_dir_all(&generated_config_dir).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(cluster_id = %cluster_id, error = %error, "failed to remove kong config directory; leaking disk space, not failing teardown over it");
@@ -701,7 +894,7 @@ mod tests {
 
     fn backend(
         runtime: FakeContainerRuntime,
-        kong_config_dir: std::path::PathBuf,
+        generated_config_dir: std::path::PathBuf,
     ) -> SupabaseBackend {
         SupabaseBackend::new(
             std::sync::Arc::new(runtime),
@@ -712,7 +905,7 @@ mod tests {
             "kong:3".to_string(),
             "supabase/edge-runtime:v1".to_string(),
             std::path::PathBuf::from("/var/lib/app_salmon/workers"),
-            kong_config_dir,
+            generated_config_dir,
             Duration::from_millis(50),
         )
     }
@@ -886,7 +1079,7 @@ mod tests {
             .iter()
             .find(|spec| spec.name == container_name(&cluster_id, "functions"))
             .expect("functions container created");
-        let mount = functions_spec.bind_mount.as_ref().expect("bind mount set");
+        let mount = functions_spec.bind_mounts.first().expect("bind mount set");
         assert_eq!(
             mount.host_path,
             "/var/lib/app_salmon/workers/salmon-worker-00/slot-3/project/functions"
@@ -926,8 +1119,8 @@ mod tests {
                 .find(|spec| spec.name == container_name(&cluster_id, "kong"))
                 .expect("kong container created");
             kong_spec
-                .bind_mount
-                .as_ref()
+                .bind_mounts
+                .first()
                 .expect("bind mount set")
                 .host_path
                 .clone()

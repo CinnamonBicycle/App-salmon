@@ -140,11 +140,11 @@ fn container_create_body(spec: &ContainerSpec, kata_runtime_name: &str) -> Conta
         }
     };
 
-    let binds = spec.bind_mount.as_ref().map(|bind_mount| {
-        vec![format!(
-            "{}:{}",
-            bind_mount.host_path, bind_mount.container_path
-        )]
+    let binds = (!spec.bind_mounts.is_empty()).then(|| {
+        spec.bind_mounts
+            .iter()
+            .map(|bind_mount| format!("{}:{}", bind_mount.host_path, bind_mount.container_path))
+            .collect::<Vec<_>>()
     });
 
     let healthcheck = spec.health_check.as_ref().map(|health_check| HealthConfig {
@@ -177,6 +177,7 @@ fn container_create_body(spec: &ContainerSpec, kata_runtime_name: &str) -> Conta
         labels: (!spec.labels.is_empty()).then(|| spec.labels.clone()),
         exposed_ports: Some(vec![container_port_proto]),
         user: spec.run_as.map(|(uid, gid)| format!("{uid}:{gid}")),
+        cmd: spec.command.clone(),
         healthcheck,
         networking_config,
         host_config: Some(HostConfig {
@@ -744,14 +745,15 @@ mod tests {
             labels: HashMap::from([("app_salmon.cluster_id".to_string(), "01ABC".to_string())]),
             port_publish: PortPublish::Ephemeral,
             container_port: 5432,
-            bind_mount: Some(BindMount {
+            bind_mounts: vec![BindMount {
                 host_path: "/var/lib/app_salmon/workers/salmon-worker-00".to_string(),
                 container_path: "/var/lib/postgresql/data".to_string(),
-            }),
+            }],
             run_as: Some((2000, 2000)),
             health_check: None,
             runtime: OciRuntime::Runc,
             network: None,
+            command: None,
         }
     }
 
@@ -1231,6 +1233,120 @@ mod tests {
             body.get("NetworkingConfig")
                 .is_none_or(serde_json::Value::is_null),
             "no networking config should be sent when the spec doesn't set one: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_start_sends_every_bind_mount_when_the_spec_has_several() {
+        let engine = FakeDockerEngine::start(InspectScenario::Running {
+            host_port: None,
+            health: FakeHealth::None,
+        });
+        let runtime = runtime(&engine);
+
+        let mut spec = sample_spec("app-salmon-multi-mount");
+        spec.bind_mounts = vec![
+            BindMount {
+                host_path: "/host/roles.sql".to_string(),
+                container_path: "/docker-entrypoint-initdb.d/init-scripts/99-roles.sql".to_string(),
+            },
+            BindMount {
+                host_path: "/host/jwt.sql".to_string(),
+                container_path: "/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql".to_string(),
+            },
+        ];
+        runtime
+            .create_and_start(&spec)
+            .await
+            .expect("create succeeds");
+
+        let body = engine
+            .last_create_body()
+            .expect("a create request was sent");
+        let binds = body["HostConfig"]["Binds"]
+            .as_array()
+            .expect("binds array sent");
+        assert_eq!(binds.len(), 2);
+        assert!(
+            binds.iter().any(|bind| bind
+                == "/host/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql")
+        );
+        assert!(binds.iter().any(
+            |bind| bind == "/host/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql"
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_and_start_sends_no_binds_when_the_spec_has_no_mounts() {
+        let engine = FakeDockerEngine::start(InspectScenario::Running {
+            host_port: None,
+            health: FakeHealth::None,
+        });
+        let runtime = runtime(&engine);
+
+        let mut spec = sample_spec("app-salmon-no-mounts");
+        spec.bind_mounts = vec![];
+        runtime
+            .create_and_start(&spec)
+            .await
+            .expect("create succeeds");
+
+        let body = engine
+            .last_create_body()
+            .expect("a create request was sent");
+        assert!(
+            body["HostConfig"]["Binds"].is_null(),
+            "no Binds should be sent when the spec has no bind mounts: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_start_sends_the_command_override_when_the_spec_has_one() {
+        let engine = FakeDockerEngine::start(InspectScenario::Running {
+            host_port: None,
+            health: FakeHealth::None,
+        });
+        let runtime = runtime(&engine);
+
+        let mut spec = sample_spec("app-salmon-command");
+        spec.command = Some(vec![
+            "start".to_string(),
+            "--main-service".to_string(),
+            "/home/deno/functions/main".to_string(),
+        ]);
+        runtime
+            .create_and_start(&spec)
+            .await
+            .expect("create succeeds");
+
+        let body = engine
+            .last_create_body()
+            .expect("a create request was sent");
+        assert_eq!(
+            body["Cmd"],
+            serde_json::json!(["start", "--main-service", "/home/deno/functions/main"])
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_start_sends_no_command_when_the_spec_has_none() {
+        let engine = FakeDockerEngine::start(InspectScenario::Running {
+            host_port: None,
+            health: FakeHealth::None,
+        });
+        let runtime = runtime(&engine);
+
+        runtime
+            .create_and_start(&sample_spec("app-salmon-no-command"))
+            .await
+            .expect("create succeeds");
+
+        let body = engine
+            .last_create_body()
+            .expect("a create request was sent");
+        assert!(
+            body["Cmd"].is_null(),
+            "no Cmd should be sent when the spec has no command override: {body}"
         );
     }
 

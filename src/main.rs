@@ -170,7 +170,7 @@ async fn build_task_deps(
         .unwrap_or_else(|| Path::new("."));
     let worker_data_dir_base = storage_dir_base.join("workers");
     let tar_staging_dir_base = storage_dir_base.join("tar-staging");
-    let kong_config_dir_base = storage_dir_base.join("kong-config");
+    let generated_config_dir_base = storage_dir_base.join("kong-config");
 
     let postgres_backend = Arc::new(PostgresBackend::new(
         container_runtime.clone(),
@@ -182,13 +182,13 @@ async fn build_task_deps(
     let supabase_backend = Arc::new(SupabaseBackend::new(
         container_runtime,
         secrets.clone(),
-        config.docker.postgres_image.clone(),
+        config.supabase.postgres_image.clone(),
         config.supabase.postgrest_image.clone(),
         config.supabase.gotrue_image.clone(),
         config.supabase.kong_image.clone(),
         config.supabase.edge_runtime_image.clone(),
         worker_data_dir_base.clone(),
-        kong_config_dir_base,
+        generated_config_dir_base,
         Duration::from_secs(config.limits.health_check_timeout_secs),
     ));
     let mut backends: HashMap<ServiceKind, Arc<dyn ClusterBackend>> = HashMap::new();

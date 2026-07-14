@@ -13,6 +13,7 @@ use app_salmon::auth::ClientRegistry;
 use app_salmon::auth::hashing::SecretHash;
 use app_salmon::backends::ClusterBackend;
 use app_salmon::backends::postgres::PostgresBackend;
+use app_salmon::backends::supabase::SupabaseBackend;
 use app_salmon::client_workers::ClientWorkers;
 use app_salmon::domain::ids::ClientId;
 use app_salmon::domain::service_kind::ServiceKind;
@@ -26,6 +27,14 @@ use chrono::TimeDelta;
 const POSTGRES_IMAGE: &str = "pgvector/pgvector:pg16";
 const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 const WORKER_DATA_DIR_BASE: &str = "/var/lib/app_salmon/workers";
+const TAR_STAGING_DIR_BASE: &str = "/var/lib/app_salmon/tar-staging";
+const GENERATED_CONFIG_DIR_BASE: &str = "/var/lib/app_salmon/generated-config";
+const SUPABASE_POSTGRES_IMAGE: &str = "supabase/postgres:17.6.1.136";
+const SUPABASE_POSTGREST_IMAGE: &str = "postgrest/postgrest:v14.12";
+const SUPABASE_GOTRUE_IMAGE: &str = "supabase/gotrue:v2.189.0";
+const SUPABASE_KONG_IMAGE: &str = "kong/kong:3.9.1";
+const SUPABASE_EDGE_RUNTIME_IMAGE: &str = "supabase/edge-runtime:v1.74.0";
+const KATA_RUNTIME_NAME: &str = "kata";
 pub const CLIENT_NAME: &str = "e2e-agent";
 pub const CLIENT_SECRET: &str = "e2e-secret-do-not-use-in-prod";
 pub const OTHER_CLIENT_NAME: &str = "e2e-agent-other";
@@ -63,7 +72,7 @@ impl Drop for TestServer {
 /// Fails loudly (panics with a clear remediation message) if this machine isn't set up for the
 /// e2e suite — never silently skips.
 pub async fn ensure_prerequisites() {
-    let runtime = match BollardContainerRuntime::connect(DOCKER_SOCKET, 5, "kata") {
+    let runtime = match BollardContainerRuntime::connect(DOCKER_SOCKET, 5, KATA_RUNTIME_NAME) {
         Ok(runtime) => runtime,
         Err(err) => panic!("docker daemon at {DOCKER_SOCKET} is not reachable: {err}{REMEDIATION}"),
     };
@@ -100,6 +109,9 @@ pub async fn ensure_prerequisites() {
 /// Builds a fresh, fully-real `AppState` (real Docker, real sudo, real `SQLite` in a tempdir) and
 /// serves it on an ephemeral local port. Each test gets its own instance — cheap, and avoids
 /// tests interfering with each other's cluster rows/quota.
+// Long by line count, not complexity: registering two backends' worth of near-identical
+// dependency wiring, not control flow.
+#[allow(clippy::too_many_lines)]
 pub async fn spawn_test_server() -> TestServer {
     ensure_prerequisites().await;
 
@@ -112,21 +124,35 @@ pub async fn spawn_test_server() -> TestServer {
             .expect("open sqlite"),
     );
     let container_runtime = Arc::new(
-        BollardContainerRuntime::connect(DOCKER_SOCKET, 10, "kata").expect("connect docker"),
+        BollardContainerRuntime::connect(DOCKER_SOCKET, 10, KATA_RUNTIME_NAME)
+            .expect("connect docker"),
     );
     let clock = Arc::new(SystemClock);
     let secrets = Arc::new(RandSecretGenerator);
     let privileged_exec = Arc::new(SudoExecutor::new("sudo", Duration::from_secs(30)));
 
     let postgres_backend = Arc::new(PostgresBackend::new(
-        container_runtime,
+        container_runtime.clone(),
         secrets.clone(),
         POSTGRES_IMAGE.to_string(),
         PathBuf::from(WORKER_DATA_DIR_BASE),
         Duration::from_mins(1),
     ));
+    let supabase_backend = Arc::new(SupabaseBackend::new(
+        container_runtime,
+        secrets.clone(),
+        SUPABASE_POSTGRES_IMAGE.to_string(),
+        SUPABASE_POSTGREST_IMAGE.to_string(),
+        SUPABASE_GOTRUE_IMAGE.to_string(),
+        SUPABASE_KONG_IMAGE.to_string(),
+        SUPABASE_EDGE_RUNTIME_IMAGE.to_string(),
+        PathBuf::from(WORKER_DATA_DIR_BASE),
+        PathBuf::from(GENERATED_CONFIG_DIR_BASE),
+        Duration::from_mins(1),
+    ));
     let mut backends: HashMap<ServiceKind, Arc<dyn ClusterBackend>> = HashMap::new();
     backends.insert(ServiceKind::Postgres, postgres_backend);
+    backends.insert(ServiceKind::Supabase, supabase_backend);
 
     let client_workers =
         system_users::resolve_client_workers(Path::new("/etc/passwd"), &configured_clients())
@@ -140,7 +166,7 @@ pub async fn spawn_test_server() -> TestServer {
         backends,
         clock: clock.clone(),
         worker_data_dir_base: PathBuf::from(WORKER_DATA_DIR_BASE),
-        tar_staging_dir_base: PathBuf::from("/var/lib/app_salmon/tar-staging"),
+        tar_staging_dir_base: PathBuf::from(TAR_STAGING_DIR_BASE),
         tar_limits: app_salmon::domain::tar_validation::TarLimits {
             max_entry_bytes: 10_485_760,
             max_total_bytes: 52_428_800,

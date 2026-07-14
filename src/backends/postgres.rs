@@ -232,10 +232,10 @@ impl ClusterBackend for PostgresBackend {
             labels,
             port_publish: PortPublish::Ephemeral,
             container_port: CONTAINER_PORT,
-            bind_mount: Some(BindMount {
+            bind_mounts: vec![BindMount {
                 host_path: host_path.display().to_string(),
                 container_path: "/var/lib/postgresql/data".to_string(),
-            }),
+            }],
             run_as: Some((worker.uid(), worker.gid())),
             health_check: Some(HealthCheck {
                 test: vec![
@@ -248,6 +248,7 @@ impl ClusterBackend for PostgresBackend {
             }),
             runtime: OciRuntime::Runc,
             network: None,
+            command: None,
         };
 
         let handle = self.container_runtime.create_and_start(&spec).await?;
@@ -681,7 +682,7 @@ mod tests {
         assert_eq!(spec.name, container_name(&cluster_id));
         assert_eq!(spec.run_as, Some((2005, 2005)));
         assert_eq!(
-            spec.bind_mount.as_ref().expect("bind mount set").host_path,
+            spec.bind_mounts.first().expect("bind mount set").host_path,
             "/var/lib/app_salmon/workers/salmon-worker-05/slot-3"
         );
         assert!(spec.env.iter().any(|(key, _)| key == "POSTGRES_PASSWORD"));

@@ -236,8 +236,10 @@ pub struct ContainerSpec {
     pub port_publish: PortPublish,
     /// The port inside the container to publish on the host.
     pub container_port: u16,
-    /// The single bind mount to attach, if any.
-    pub bind_mount: Option<BindMount>,
+    /// Bind mounts to attach — zero or more (e.g. a Supabase `db` container mounts both
+    /// `roles.sql` and `jwt.sql` into `/docker-entrypoint-initdb.d/init-scripts/`, not just one
+    /// file).
+    pub bind_mounts: Vec<BindMount>,
     /// `--user uid:gid`, if set; ties the in-container process to a specific worker account.
     pub run_as: Option<(u32, u32)>,
     /// If set, overrides the image's own `HEALTHCHECK` (or adds one to images that don't declare
@@ -250,6 +252,10 @@ pub struct ContainerSpec {
     /// Which Docker network to join and under what alias, if any. `None` means the container
     /// gets only the daemon's default network with no custom alias.
     pub network: Option<NetworkAttachment>,
+    /// If set, overrides the image's own `ENTRYPOINT`/`CMD` argv (e.g. the Supabase edge-runtime
+    /// image needs `["start", "--main-service", "<path>"]` rather than its default). `None` uses
+    /// whatever the image itself declares.
+    pub command: Option<Vec<String>>,
 }
 
 impl fmt::Debug for ContainerSpec {
@@ -277,11 +283,12 @@ impl fmt::Debug for ContainerSpec {
             .field("labels", &self.labels)
             .field("port_publish", &self.port_publish)
             .field("container_port", &self.container_port)
-            .field("bind_mount", &self.bind_mount)
+            .field("bind_mounts", &self.bind_mounts)
             .field("run_as", &self.run_as)
             .field("health_check", &self.health_check)
             .field("runtime", &self.runtime)
             .field("network", &self.network)
+            .field("command", &self.command)
             .finish()
     }
 }
@@ -522,10 +529,10 @@ mod tests {
             labels,
             port_publish: PortPublish::Ephemeral,
             container_port: 5432,
-            bind_mount: Some(BindMount {
+            bind_mounts: vec![BindMount {
                 host_path: "/var/lib/app_salmon/workers/salmon-worker-00".to_string(),
                 container_path: "/var/lib/postgresql/data".to_string(),
-            }),
+            }],
             run_as: Some((2000, 2000)),
             health_check: None,
             runtime: OciRuntime::Runc,
@@ -533,6 +540,7 @@ mod tests {
                 network_name: "app-salmon-net-01ABC".to_string(),
                 alias: "db".to_string(),
             }),
+            command: None,
         }
     }
 

@@ -84,18 +84,24 @@ pub struct LimitsConfig {
 pub struct DockerConfig {
     /// Filesystem path to the Docker Engine API's Unix domain socket.
     pub socket_path: String,
-    /// The Postgres/pgvector image reference to run for each cluster. Also used as
-    /// `ServiceKind::Supabase`'s `db` container image — Supabase doesn't get a separate one, per
-    /// `docs/DESIGN.md` §11.
+    /// The Postgres/pgvector image reference to run for each `ServiceKind::Postgres` cluster.
+    /// **Not** reused for `ServiceKind::Supabase`'s `db` container — see
+    /// [`SupabaseConfig::postgres_image`] for why that needs a different image entirely.
     pub postgres_image: String,
 }
 
-/// `[supabase]` — images for the four non-Postgres containers a `ServiceKind::Supabase` cluster
-/// runs, plus the name Kata is registered under in the guest's Docker `daemon.json`. Required
-/// alongside `[docker]`, matching this project's no-silent-partial-config convention — see
-/// `docs/DESIGN.md` §11.
+/// `[supabase]` — images for the five containers a `ServiceKind::Supabase` cluster runs, plus the
+/// name Kata is registered under in the guest's Docker `daemon.json`. Required alongside
+/// `[docker]`, matching this project's no-silent-partial-config convention — see `docs/DESIGN.md`
+/// §11.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SupabaseConfig {
+    /// The Postgres image reference to run for each Supabase cluster's `db` container —
+    /// deliberately **not** [`DockerConfig::postgres_image`]: `PostgREST`/`GoTrue` connect as
+    /// Supabase-specific roles (`authenticator`, `supabase_auth_admin`) that only exist if this is
+    /// upstream's own `supabase/postgres` image, not a generic Postgres+pgvector one — see
+    /// `backends::supabase`'s module doc comment.
+    pub postgres_image: String,
     /// The `PostgREST` image reference to run for each Supabase cluster's `rest` container.
     pub postgrest_image: String,
     /// The `GoTrue` image reference to run for each Supabase cluster's `auth` container.
@@ -321,10 +327,11 @@ socket_path = "/var/run/docker.sock"
 postgres_image = "pgvector/pgvector:pg16"
 
 [supabase]
-postgrest_image = "postgrest/postgrest:v12"
-gotrue_image = "supabase/gotrue:v2"
-kong_image = "kong:3"
-edge_runtime_image = "supabase/edge-runtime:v1"
+postgres_image = "supabase/postgres:17.6.1.136"
+postgrest_image = "postgrest/postgrest:v14.12"
+gotrue_image = "supabase/gotrue:v2.189.0"
+kong_image = "kong/kong:3.9.1"
+edge_runtime_image = "supabase/edge-runtime:v1.74.0"
 kata_runtime_name = "kata"
 
 [storage]
