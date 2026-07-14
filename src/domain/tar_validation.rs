@@ -13,7 +13,15 @@
 //! hardlinks, device/fifo files, and size limits. This module adds exactly those checks, before
 //! ever calling `unpack_in` on an entry — not a reimplementation of what the crate already does
 //! correctly.
+//!
+//! It also normalizes every extracted entry's mode to a fixed, world-readable value
+//! (`0o755`/`0o644`) after `unpack_in` places it, overriding whatever the untrusted tar's own
+//! header specified. Extraction runs as the `app_salmon` process, but the extracted tree is later
+//! read by a *different* uid (a privileged copy performed as the owning worker account, see
+//! `service::spawn_task::adopt_project_tar`) — an attacker-chosen restrictive mode would otherwise
+//! silently break that step.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use tar::{Archive, EntryType};
@@ -205,6 +213,30 @@ pub fn validate_and_extract(
                 path: path_for_error,
             });
         }
+
+        // `unpack_in` preserves whatever mode bits the entry's own header specified — under
+        // caller control, since the whole tar is untrusted input. A mode too restrictive to read
+        // (or, for a directory, to traverse) would silently break the later worker-owned copy,
+        // which runs as a *different* uid than this extraction — so force a known-safe mode here
+        // rather than trust the upload. No secrets are expected in a project tree, so a uniform
+        // world-readable mode is fine.
+        let extracted_path = dest.join(
+            entry
+                .path()
+                .map_err(|source| TarValidationError::Read { index, source })?,
+        );
+        let mode = if entry_type == EntryType::Directory {
+            0o755
+        } else {
+            0o644
+        };
+        std::fs::set_permissions(&extracted_path, std::fs::Permissions::from_mode(mode)).map_err(
+            |source| TarValidationError::Extract {
+                index,
+                path: path_for_error,
+                source,
+            },
+        )?;
     }
 
     Ok(())
@@ -212,6 +244,8 @@ pub fn validate_and_extract(
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::{TarLimits, TarValidationError, validate_and_extract};
     use tar::{Builder, Header};
 
@@ -330,6 +364,55 @@ mod tests {
         let extracted = std::fs::read_to_string(dest.path().join("functions/hello/index.ts"))
             .expect("read extracted file");
         assert_eq!(extracted, "export default () => new Response('ok');");
+    }
+
+    #[test]
+    fn normalizes_extracted_modes_regardless_of_the_tar_headers_own_mode() {
+        // A worker-owned privileged copy (a different uid than this extraction) must be able to
+        // read every extracted file and traverse every extracted directory afterward — see
+        // `service::spawn_task::adopt_project_tar`. An untrusted upload could specify a
+        // restrictive mode (accidentally, or adversarially); this must not survive extraction.
+        let dest = tempfile::tempdir().expect("tempdir");
+        let mut builder = Builder::new(Vec::new());
+        let mut dir_header = Header::new_gnu();
+        dir_header.set_path("secretdir").expect("set path");
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_size(0);
+        dir_header.set_mode(0o700);
+        dir_header.set_cksum();
+        builder
+            .append(&dir_header, std::io::empty())
+            .expect("append dir entry");
+
+        let content = b"shh";
+        let mut file_header = Header::new_gnu();
+        file_header
+            .set_path("secretdir/secret.txt")
+            .expect("set path");
+        file_header.set_entry_type(tar::EntryType::Regular);
+        file_header.set_size(content.len() as u64);
+        file_header.set_mode(0o600);
+        file_header.set_cksum();
+        builder
+            .append(&file_header, content.as_slice())
+            .expect("append file entry");
+        let tar_bytes = builder.into_inner().expect("finish tar");
+
+        validate_and_extract(&tar_bytes, dest.path(), &GENEROUS_LIMITS)
+            .expect("extraction succeeds");
+
+        let dir_mode = std::fs::metadata(dest.path().join("secretdir"))
+            .expect("stat dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(dest.path().join("secretdir/secret.txt"))
+            .expect("stat file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o755);
+        assert_eq!(file_mode, 0o644);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! that's what guarantees exactly one task ever tears a given cluster down: the caller that
 //! cancels a spawn does not *also* start a fresh teardown task racing against this one.
 
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -64,12 +65,22 @@ fn sanitize_tar_error(error: &TarValidationError) -> String {
 /// Runs before any backend `spawn()` call, so a malformed upload is rejected before any container
 /// is created (see `docs/DESIGN.md` §11).
 ///
+/// The staging directory is `<tar_staging_dir_base>/<worker>/slot-<slot>` — the same
+/// `<worker>/slot-<N>` shape as [`worker_data_dir`], not one keyed on `cluster_id`. This keeps the
+/// set of possible staging paths bounded and enumerable in advance (one per `(worker, slot)`
+/// pair), so the privileged executor's sudoers rule for `AdoptStagedTree` can be written as exact
+/// literal paths, matching this project's no-wildcard sudoers convention (see
+/// `scripts/setup-e2e-env.sh`) instead of needing a path built from a caller-supplied
+/// `cluster_id`. Collision-free for the same reason worker/slot pairs already are: at most one
+/// live cluster occupies a given slot at a time.
+///
 /// # Arguments
 ///
 /// - `deps`: shared task dependencies — `tar_staging_dir_base`/`tar_limits` for validation,
 ///   `privileged_exec` for the worker-owned copy.
-/// - `cluster_id`: used to name this attempt's staging subdirectory uniquely.
-/// - `worker`: the worker account to run the privileged copy as.
+/// - `worker`: the worker account to run the privileged copy as; also selects the staging
+///   subdirectory.
+/// - `slot`: the cluster's slot number; also selects the staging subdirectory.
 /// - `dest`: the pre-existing, worker-owned destination directory to copy the extracted tree
 ///   into — must already exist (via a prior `PrepareWorkerDir`).
 /// - `tar_bytes`: the raw, not-yet-validated tar archive bytes.
@@ -89,17 +100,34 @@ fn sanitize_tar_error(error: &TarValidationError) -> String {
 /// convention, e.g. `teardown_task`'s wipe-failure handling).
 async fn adopt_project_tar(
     deps: &TaskDeps,
-    cluster_id: &crate::domain::ids::ClusterId,
     worker: &crate::domain::ids::WorkerUser,
+    slot: u32,
     dest: &std::path::Path,
     tar_bytes: &[u8],
 ) -> Result<(), ClusterError> {
-    let staging = deps.tar_staging_dir_base.join(cluster_id.to_string());
+    let staging = worker_data_dir(&deps.tar_staging_dir_base, worker, slot);
     tokio::fs::create_dir_all(&staging)
         .await
         .map_err(|_source| {
             ClusterError::BackendSpawnFailed("failed to prepare staging directory".to_string())
         })?;
+
+    // The later `AdoptStagedTree` copy runs as `worker`, a different uid than this
+    // (app_salmon-owned) process — it must be able to traverse every ancestor directory we just
+    // created to reach the extracted files. Set the mode explicitly rather than trusting this
+    // process's umask, which may be more restrictive than world-traversable in some deployments.
+    for ancestor in [
+        deps.tar_staging_dir_base.join(worker.as_str()),
+        staging.clone(),
+    ] {
+        tokio::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o755))
+            .await
+            .map_err(|_source| {
+                ClusterError::BackendSpawnFailed(
+                    "failed to prepare staging directory permissions".to_string(),
+                )
+            })?;
+    }
 
     let limits = deps.tar_limits;
     let tar_bytes = tar_bytes.to_vec();
@@ -132,7 +160,7 @@ async fn adopt_project_tar(
     };
 
     if let Err(error) = tokio::fs::remove_dir_all(&staging).await {
-        tracing::warn!(cluster_id = %cluster_id, error = %error, "failed to remove tar staging directory; leaking disk space, not failing the spawn over it");
+        tracing::warn!(worker = %worker.as_str(), slot, error = %error, "failed to remove tar staging directory; leaking disk space, not failing the spawn over it");
     }
 
     outcome
@@ -239,8 +267,8 @@ async fn do_spawn(
     if let Some(tar_bytes) = project_tar {
         adopt_project_tar(
             deps,
-            &cluster.id,
             &worker,
+            cluster.slot,
             &base.join(PROJECT_SUBDIR),
             tar_bytes,
         )
@@ -725,7 +753,6 @@ mod tests {
             .try_insert_if_under_quota(&cluster, 10)
             .await
             .expect("seed row");
-        let cluster_id = cluster.id;
 
         do_spawn(&deps, &mut cluster, Some(&sample_tar_bytes()))
             .await
@@ -737,7 +764,7 @@ mod tests {
             2,
             "expected a PrepareWorkerDir then an AdoptStagedTree"
         );
-        let expected_staging = staging_root.path().join(cluster_id.to_string());
+        let expected_staging = staging_root.path().join("salmon-worker-00").join("slot-0");
         assert_eq!(
             calls[1],
             PrivilegedCommand::AdoptStagedTree {
@@ -779,7 +806,6 @@ mod tests {
             .try_insert_if_under_quota(&cluster, 10)
             .await
             .expect("seed row");
-        let cluster_id = cluster.id;
 
         let err = do_spawn(&deps, &mut cluster, Some(b"this is not a tar file"))
             .await
@@ -796,7 +822,11 @@ mod tests {
             PrivilegedCommand::PrepareWorkerDir { .. }
         ));
         assert!(
-            !staging_root.path().join(cluster_id.to_string()).exists(),
+            !staging_root
+                .path()
+                .join("salmon-worker-00")
+                .join("slot-0")
+                .exists(),
             "staging directory should be cleaned up even after a failed extraction"
         );
     }
