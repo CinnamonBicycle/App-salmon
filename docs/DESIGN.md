@@ -1012,15 +1012,75 @@ already in — `ServiceKind::Supabase` requests route through the real backend n
 `kata_runtime_name` closes the cross-artifact placeholder from M0/M4a: `main.rs` no longer hard-codes
 `"kata"` when connecting `BollardContainerRuntime` — it comes from config, which
 `scripts/vm/guest-provision.sh`'s own registration must continue to match (same invariant class
-`docs/DESIGN.md` §8a already documents elsewhere). `db`'s image is deliberately *not* duplicated
-into `[supabase]` — `SupabaseBackend` reuses `[docker].postgres_image`, the same image
-`PostgresBackend` runs, per the M4b design note that Supabase's `db` isn't a separate image.
+`docs/DESIGN.md` §8a already documents elsewhere). At M5 time, `db`'s image was *not* duplicated
+into `[supabase]` — `SupabaseBackend` reused `[docker].postgres_image`. **Corrected in the M6 work
+below**: it needed its own `[supabase].postgres_image`, pointed at upstream's own
+`supabase/postgres` image, not the plain Postgres+pgvector one.
+
+### M6 progress: corrected against upstream's real compose file, not yet boot-verified
+
+Before booting, read `supabase/supabase`'s own `docker/docker-compose.yml`, `.env.example`, and
+`docker/volumes/db/{roles,jwt}.sql` directly (not assumed from training data) and corrected every
+M4b placeholder against them:
+
+- **`db` needed a different image entirely, not just a wrong tag.** `PostgREST`/`GoTrue` connect
+  as Supabase-specific roles (`authenticator`, `supabase_auth_admin`) that only exist if `db` runs
+  upstream's own `supabase/postgres` image — its Dockerfile bakes in those roles, the `auth`
+  schema, `anon`/`authenticated`/`service_role`, and (relevantly for §3's pgvector requirement) the
+  `vector` extension already available, none of which a generic `pgvector/pgvector` image has.
+  Added `[supabase].postgres_image`, distinct from `[docker].postgres_image` — the M5-era "Supabase
+  doesn't get a separate image" note above was wrong; corrected here, not carried forward.
+- **`roles.sql`/`jwt.sql` don't need per-cluster templating.** They read `$POSTGRES_PASSWORD`/
+  `$JWT_SECRET`/`$JWT_EXP` from the container's own environment via `psql`'s `` \set var
+  `echo "$VAR"` `` mechanism at initdb time — so `SupabaseBackend` pins their content verbatim as
+  Rust consts and just bind-mounts them into `/docker-entrypoint-initdb.d/init-scripts/`, alongside
+  setting those three env vars. This is why `ContainerSpec::bind_mount` (a single `Option`) became
+  `bind_mounts: Vec<BindMount>` — `db` alone needs two independent mount points.
+- **`rest`/`auth`/`kong`/`functions` env vars, ports, and healthchecks were transcribed from
+  upstream**, not reinvented: `GOTRUE_DB_DATABASE_URL` (not the placeholder `DATABASE_URL`),
+  `PGRST_DB_URI` against the `authenticator` role, Kong's `KONG_DECLARATIVE_CONFIG` at
+  `/usr/local/kong/kong.yml` (not the placeholder `/kong/declarative/kong.yml`), and real
+  healthchecks (`pg_isready -h localhost`, `postgrest --ready`, a `wget`-spider against
+  `/health`, `kong health`) replacing the "just wait for `Running`" `None` placeholders — so a
+  container that's `Running` but still initializing no longer gets treated as ready.
+- **`functions` needed a different mount path and an explicit command**, not just a different
+  port: upstream mounts the caller's functions at `/home/deno/functions` (not the placeholder
+  `/functions`) and invokes `edge-runtime` with `start --main-service
+  /home/deno/functions/main` — meaning a caller's tar must place its one edge function at
+  `functions/main/` specifically for this pass, not an arbitrary name. Added
+  `ContainerSpec::command: Option<Vec<String>>`, since nothing previously let a backend override a
+  container's entrypoint args.
+- **`db` no longer runs as the worker's uid/gid.** It has no worker-owned bind mount (Supabase
+  clusters don't persist container-internal state — see the module doc comment), so the earlier
+  `run_as: Some((worker.uid(), worker.gid()))` served no purpose and only risked fighting
+  `supabase/postgres`'s own internal-user assumptions for its data directory.
+- **Tar-staging paths were unbounded, and extracted-file modes were caller-controlled.** Two
+  correctness gaps found while working out the sudoers rule this needs (below): `adopt_project_tar`
+  staged uploads under `<base>/<cluster_id>` — unbounded, so no literal sudoers rule could cover
+  it. Switched to the same `<worker>/slot-<N>` shape `worker_data_dir` already uses, and explicitly
+  `chmod`s the staging ancestors, since the privileged copy that follows runs as a different uid
+  than extraction. Separately, `tar_validation::validate_and_extract` was preserving whatever mode
+  bits an untrusted upload's own tar header specified — normalized to a fixed `0755`/`0644` after
+  extraction instead, so a restrictive (accidental or adversarial) mode can't silently break that
+  same privileged copy.
+- **`scripts/setup-e2e-env.sh` extended**, not yet exercised: an `AdoptStagedTree` sudoers rule
+  (`cp -r <staging>/. <dest>`, one per `(client, slot)`, matching the exact argv
+  `adapters::sudo_exec` emits), a `mkdir -p <slot>/project/functions` rule alongside the existing
+  bare-slot one (since `SupabaseBackend::worker_subdirs()` targets it), `app_salmon`-owned
+  tar-staging/generated-config base directories (unlike `WORKER_DATA_DIR_BASE`, these two are
+  written directly by `app_salmon`'s own unprivileged code, not only by privileged per-client
+  commands), and pulls for all five Supabase images.
+
+**Still not proof the real containers behave as intended together** — reading a compose file
+correctly transcribes upstream's own choices, but doesn't confirm e.g. whether `db` needs anything
+from upstream's `db-config` named volume (a persisted pgsodium key) just to start cleanly, or
+whether Kong's default router flavor really accepts this backend's `paths:`-based declarative
+config the way assumed above. That confirmation is the remaining M6 step: boot the full stack once
+against the real VM, and — because health-waits run sequentially — let it climb as far as it gets
+and stop at the first broken rung, fix that one specific thing against real container logs, and
+re-run, rather than trying to pre-verify every remaining unknown by more reading.
 
 ### Not yet built
 
-M6: real e2e verification of the whole stack against the actual VM — Postgres+pgvector alone under
-the new backend path first, then +PostgREST+GoTrue (inter-container DNS-by-alias, new territory),
-then +Kong (ingress), then the edge-function container under real Kata with a genuinely
-tar-supplied function actually executing. This is where every M4b placeholder (container ports,
-env var names, the edge-runtime mount-path convention) and the M4b-review fixes (health-wait
-semantics, `PortPublish`, `functions` worker-ownership) get checked against reality, not assumed.
+The real boot itself (see above), and `tests/e2e/create_supabase_cluster.rs`, which doesn't exist
+yet.

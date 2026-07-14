@@ -41,7 +41,7 @@ else
 		'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
 fi
 
-echo "== e2e prerequisites (client accounts, sudoers rule, postgres image) =="
+echo "== e2e prerequisites (client accounts, sudoers rule, images) =="
 # setup-e2e-env.sh is itself written to be safe to re-run (every step checks current state), so
 # calling it on every provision pass rather than only on first boot is deliberate, not wasteful.
 APP_SALMON_USER="$GUEST_USER" /repo/scripts/setup-e2e-env.sh
