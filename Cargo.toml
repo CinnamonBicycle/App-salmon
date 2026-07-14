@@ -36,7 +36,7 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
 [dev-dependencies]
 mockall = "0.15.0"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "multipart"] }
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["test-util"] }
 

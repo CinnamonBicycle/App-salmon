@@ -261,6 +261,40 @@ pub async fn create_cluster(
     (status, body)
 }
 
+/// Sends `POST /clusters` on the `multipart/form-data` path (`service: "supabase"`), with
+/// `project_tar_bytes` as the `project_tar` part.
+pub async fn create_supabase_cluster(
+    server: &TestServer,
+    ttl_secs: i64,
+    project_tar_bytes: Vec<u8>,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let metadata = serde_json::json!({"service": "supabase", "ttl_secs": ttl_secs}).to_string();
+    let form = reqwest::multipart::Form::new()
+        .part(
+            "metadata",
+            reqwest::multipart::Part::text(metadata)
+                .mime_str("application/json")
+                .expect("mime"),
+        )
+        .part(
+            "project_tar",
+            reqwest::multipart::Part::bytes(project_tar_bytes)
+                .mime_str("application/x-tar")
+                .expect("mime"),
+        );
+    let response = server
+        .client
+        .post(format!("{}/clusters", server.base_url))
+        .header("authorization", auth_value())
+        .multipart(form)
+        .send()
+        .await
+        .expect("request");
+    let status = response.status();
+    let body = response.json().await.expect("json");
+    (status, body)
+}
+
 /// Polls `GET /clusters/{id}` until it reports `ready` or `failed`, or panics after `timeout` —
 /// a real Postgres container genuinely takes real wall-clock time to become healthy.
 pub async fn wait_for_ready_or_failed(

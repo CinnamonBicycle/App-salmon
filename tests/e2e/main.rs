@@ -24,6 +24,7 @@
 
 mod common;
 mod create_cluster;
+mod create_supabase_cluster;
 mod delete_cluster;
 mod info_cluster;
 mod list_clusters;
